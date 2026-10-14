@@ -37,7 +37,7 @@ nonisolated struct AgentProviderResponseParser {
         }
         // Gateways commonly omit the SSE event field and use the JSON type.
         let eventType = AgentProviderResponseDecoder.streamEventType(event, root: root)
-        if eventType == "error" || eventType == "response.failed" {
+        if eventType == "error" || eventType == "response.failed" || Self.carriesError(root) {
             throw Self.streamFailure(in: root)
         }
         let events: [AgentModelStreamEvent]
@@ -104,6 +104,21 @@ nonisolated struct AgentProviderResponseParser {
         return streamFailure(in: root)
     }
 
+    /// A frame whose root `error` is an object with a message, code or type,
+    /// or a non-empty string. Gateways that keep the Chat Completions shape
+    /// report a failure after the stream has started this way, with neither
+    /// an SSE event name nor a `type`; skipping the frame would end the
+    /// stream without its reason. A null or empty `error` beside normal
+    /// content is not a failure.
+    private static func carriesError(_ root: [String: Any]) -> Bool {
+        if let text = root["error"] as? String { return !text.isEmpty }
+        guard let error = root["error"] as? [String: Any] else { return false }
+        return ["message", "code", "type"].contains { key in
+            if let value = error[key] as? String { return !value.isEmpty }
+            return error[key] is NSNumber
+        }
+    }
+
     private static func streamFailure(in root: [String: Any]) -> AgentProviderStreamFailure {
         let response = root["response"] as? [String: Any]
         let error = (response?["error"] ?? root["error"]) as? [String: Any]
@@ -111,6 +126,7 @@ nonisolated struct AgentProviderResponseParser {
         let message =
             error?["message"] as? String
             ?? response?["error"] as? String
+            ?? root["error"] as? String
             ?? root["message"] as? String
             ?? String(localized: "The model provider failed to complete the response.", bundle: .module)
         return AgentProviderStreamFailure(code: code, message: message)
