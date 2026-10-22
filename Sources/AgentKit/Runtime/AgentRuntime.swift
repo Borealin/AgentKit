@@ -15,6 +15,10 @@ public nonisolated struct AgentLoopConfiguration: Sendable {
     /// Retries transient model-provider failures without replaying tools.
     public var modelRetryPolicy = AgentModelRetryPolicy()
     public var outputProjection = AgentToolOutputProjection()
+    /// Registers the shared scratch tools used by the default output contract.
+    /// Hosts with their own bounded output and explicit capability catalog can
+    /// disable this; tools explicitly present in their registry are retained.
+    public var includesSharedScratchTools = true
     public var contextSnapshot: @Sendable (String?, Bool) -> AgentTurnContextSnapshot = {
         AgentTurnContextSnapshot(sessionContext: $0, planContract: $1 ? AgentPlanContractInjection.contract : nil)
     }
@@ -102,9 +106,11 @@ public actor AgentRuntime {
         channel: AgentEventChannel? = nil
     ) {
         self.model = model
-        self.tools = AgentToolCatalog.registry(
-            builtIn: .init(groups: [], workspace: configuration.outputProjection.workspace),
-            additional: registry.registeredTools)
+        self.tools =
+            configuration.includesSharedScratchTools
+            ? AgentToolCatalog.registry(
+                builtIn: .init(groups: [], workspace: configuration.outputProjection.workspace),
+                additional: registry.registeredTools) : registry
         self.approval = approval
         self.repository = repository
         self.secretBroker = secretBroker

@@ -217,6 +217,10 @@ without writing every streaming text delta. It must eventually finish or throw, 
 `flush()` recursively on its own channel. For `emitCommitted` (used for successful completion), the
 callback must commit independently of that event's UI delivery: publication waits for the callback.
 
+`AgentLoopConfiguration.includesSharedScratchTools` defaults to `true`, retaining the upstream
+scratch/output contract. A host with its own bounded output and capability catalog can set it to
+`false` to use exactly its supplied registry; its explicitly registered tools remain available.
+
 ## Built-in tools
 
 Select groups with `AgentBuiltInToolConfiguration.groups` (default: `.all`). Individual tools are

@@ -8,7 +8,9 @@ private enum CommitTestFailure: Error { case write }
 private actor CommitProbe {
     var requests = 0
     var executed: [String] = []
-    func request() -> Int {
+    var toolNames: Set<String> = []
+    func request(_ tools: [AgentToolDescriptor]) -> Int {
+        toolNames = Set(tools.map(\.name))
         defer { requests += 1 }
         return requests
     }
@@ -20,7 +22,7 @@ private struct CommitModel: AgentModelStreaming {
     func stream(_ request: AgentModelRequest) -> AsyncThrowingStream<AgentModelStreamEvent, any Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
-                if await probe.request() == 0 {
+                if await probe.request(request.tools) == 0 {
                     for name in ["first", "second"] {
                         continuation.yield(
                             .toolCallSnapshot(id: name, providerItemID: nil, name: name, arguments: "{}"))
@@ -52,11 +54,13 @@ private func commitTools(_ probe: CommitProbe) -> [AnyAgentTool] {
 
 private func commitRun(
     repository: any AgentRunPersisting = InMemoryAgentRunRepository(), probe: CommitProbe,
+    includesSharedScratchTools: Bool = true,
     committing: (@Sendable (AgentEvent) async throws -> Void)? = nil
 ) async -> [AgentEvent] {
     let channel = AgentEventChannel(repository: repository, committing: committing)
     var configuration = AgentLoopConfiguration()
     configuration.toolExecution = .sequential
+    configuration.includesSharedScratchTools = includesSharedScratchTools
     let runtime = AgentRuntime(
         model: CommitModel(probe: probe), tools: commitTools(probe),
         approval: AgentApprovalBroker(reviewer: nil, manualApproval: { _ in .allow }),
@@ -75,6 +79,15 @@ private func committedOutcome(_ events: [AgentEvent]) -> AgentRunState? {
 }
 
 @Suite struct AgentCommitTests {
+    @Test(arguments: [true, false])
+    func hostCanKeepAnExplicitCatalogWithoutChangingTheDefault(shared: Bool) async {
+        let probe = CommitProbe()
+        let events = await commitRun(probe: probe, includesSharedScratchTools: shared)
+        #expect(committedOutcome(events) == .completed)
+        #expect(await probe.toolNames.contains("scratch_read") == shared)
+        #expect(await probe.toolNames.isSuperset(of: ["first", "second"]))
+    }
+
     @Test func failedMessageCommitStopsBothTools() async {
         let probe = CommitProbe()
         let events = await commitRun(probe: probe) { event in
