@@ -206,7 +206,10 @@ Live Chat Completions keep reading after a finish reason because usage may follo
   another model turn, or dispatching a tool. The first write failure stops further dispatch. A completed
   snapshot is saved before the completed terminal event is published; cancellation drains accepted
   writes and saves its terminal snapshot from an uncancelled cleanup task. Failure is still reported
-  when the terminal save itself cannot be written. None of these boundaries replays a tool action.
+  when the terminal save itself cannot be written. Cancelling while a completed assistant message
+  awaits its commit settles every call as not started, with a result and card, before terminal cleanup.
+  Calls cancelled at the dispatch fence retain that same explicit not-started reason.
+  None of these boundaries replays a tool action.
 
 Hosts with an authoritative transcript writer can pass an async throwing `committing` callback to
 `AgentEventChannel`, then pass that same channel and repository to the runtime. For ordinary `emit`

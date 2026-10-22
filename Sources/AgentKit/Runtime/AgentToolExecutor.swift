@@ -406,7 +406,9 @@ public nonisolated struct AgentToolExecutor: Sendable {
             ready,
             AgentToolResult(
                 callID: ready.invocation.call.id,
-                content: error.localizedDescription, isError: true,
+                content: error is CancellationError
+                    ? AgentInterruptedToolCall.notStartedReason : error.localizedDescription,
+                isError: true,
                 metadata: ["not_dispatched": .bool(true)]))
     }
 }

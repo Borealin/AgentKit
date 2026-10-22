@@ -5,6 +5,38 @@ import Testing
 
 @Suite
 struct AgentToolLifecycleTests {
+    @Test
+    func cancellingTheDispatchCommitRecordsThatTheToolNeverRan() async throws {
+        let probe = ToolLifecycleProbe()
+        let (waiting, signal) = AsyncStream<Void>.makeStream()
+        let (release, unblock) = AsyncStream<Void>.makeStream()
+        let channel = AgentEventChannel(repository: InMemoryAgentRunRepository()) { event in
+            if case .toolStarted = event {
+                signal.yield(())
+                for await _ in release { break }
+            }
+        }
+        let write = tool("write") { invocation, _ in
+            probe.record("write")
+            return AgentToolResult(callID: invocation.call.id, content: "written")
+        }
+        let scheduler = AgentToolScheduler(executor: executor([write], channel: channel))
+        let task = Task { await scheduler.run(calls(["write"])) }
+        for await _ in waiting { break }
+        task.cancel()
+        let results = await task.value
+        unblock.yield(())
+        unblock.finish()
+        signal.finish()
+        try await channel.flush()
+        channel.finish()
+        #expect(probe.names.isEmpty)
+        let result = try #require(results.first)
+        #expect(result.isError)
+        #expect(result.content == AgentInterruptedToolCall.notStartedReason)
+        #expect(result.metadata["not_dispatched"] == .bool(true))
+    }
+
     @Test(arguments: [AgentToolExecutionMode.sequential, .parallel])
     func cancellationSettlesUnstartedCallsWithoutDispatchingThem(_ mode: AgentToolExecutionMode) async {
         let probe = ToolLifecycleProbe()

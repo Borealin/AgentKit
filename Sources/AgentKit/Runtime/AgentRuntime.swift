@@ -280,7 +280,21 @@ public actor AgentRuntime {
                 // once per turn it survived.
                 if !turn.usage.isEmpty { channel.emit(.usageUpdated(turn.usage)) }
                 channel.emit(.turnFinished(index: index, stopReason: turn.reason))
-                try await persist(snapshot)
+                do {
+                    try await persist(snapshot)
+                } catch is CancellationError {
+                    // The completed message is already visible to the host, but
+                    // none of its calls has reached the scheduler. Settle them
+                    // before terminal cleanup drains and saves the transcript.
+                    let results = scheduler.fail(
+                        turn.message.toolCalls, reason: AgentInterruptedToolCall.notStartedReason,
+                        sourceMessageID: turn.message.id)
+                    for (call, result) in zip(turn.message.toolCalls, results) {
+                        snapshot.messages.append(
+                            AgentTranscriptMessage.toolResult(result, runID: runID, toolName: call.name))
+                    }
+                    throw CancellationError()
+                }
 
                 if turn.reason == .error { throw AgentRuntimeError.providerFailed }
                 guard !turn.message.toolCalls.isEmpty else {

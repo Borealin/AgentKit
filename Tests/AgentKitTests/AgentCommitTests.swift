@@ -191,6 +191,47 @@ private func committedOutcome(_ events: [AgentEvent]) -> AgentRunState? {
         let stored = await repository.loadConversations().first { $0.id == conversationID }
         #expect(stored?.lastRunState == .cancelled)
     }
+
+    @Test func cancellationWhileMessageCommitWaitsSettlesEveryCallWithoutDispatch() async throws {
+        let entered = CommitTestGate()
+        let release = CommitTestGate()
+        let probe = CommitProbe()
+        let repository = InMemoryAgentRunRepository()
+        let channel = AgentEventChannel(repository: repository) { event in
+            if case .messageFinished = event {
+                await entered.open()
+                await release.wait()
+            }
+        }
+        let runtime = AgentRuntime(
+            model: CommitModel(probe: probe), tools: commitTools(probe),
+            approval: AgentApprovalBroker(reviewer: nil, manualApproval: { _ in .allow }),
+            repository: repository, channel: channel)
+        let conversationID = UUID()
+        let events = await runtime.start(
+            AgentRunRequest(conversationID: conversationID, prompt: "go", permissionMode: .fullAccess))
+        let reader = Task { () -> [AgentEvent] in
+            var collected: [AgentEvent] = []
+            for await event in events { collected.append(event) }
+            return collected
+        }
+        await entered.wait()
+        await runtime.cancel()
+        await release.open()
+        let collected = await reader.value
+        let results = collected.compactMap {
+            if case .toolFinished(_, let result) = $0 { result } else { nil as AgentToolResult? }
+        }
+        #expect(await probe.executed.isEmpty)
+        #expect(await probe.requests == 1)
+        #expect(committedOutcome(collected) == .cancelled)
+        #expect(results.map(\.callID) == ["first", "second"])
+        #expect(results.allSatisfy { $0.isError && $0.content == AgentInterruptedToolCall.notStartedReason })
+        let stored = try #require(await repository.loadConversations().first { $0.id == conversationID })
+        #expect(stored.lastRunState == .cancelled)
+        #expect(stored.messages.map(\.role) == [.user, .assistant, .tool, .tool])
+        #expect(stored.messages.suffix(2).map(\.toolCallID) == ["first", "second"])
+    }
 }
 
 private struct CancellableCommitModel: AgentModelStreaming {
