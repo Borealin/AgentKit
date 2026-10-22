@@ -252,6 +252,13 @@ public nonisolated struct AgentToolExecutor: Sendable {
         guard case .ready(let ready) = planned else { return planned.result }
         guard !Task.isCancelled else { return await cancelBeforeStarting(ready) }
 
+        do {
+            try await channel.flush()
+            try Task.checkCancellation()
+        } catch {
+            return await notDispatched(ready, error: error)
+        }
+
         let hookDecision = await hooks.willExecute(
             AgentToolCallContext(
                 invocation: ready.invocation, descriptor: ready.descriptor,
@@ -286,6 +293,12 @@ public nonisolated struct AgentToolExecutor: Sendable {
         case .allow:
             guard !Task.isCancelled else { return await cancelBeforeStarting(ready) }
             channel.emit(.toolStarted(ready.invocation))
+            do {
+                try await channel.flush()
+                try Task.checkCancellation()
+            } catch {
+                return await notDispatched(ready, error: error)
+            }
             let gate = AgentToolProgressGate()
             let result: AgentToolResult
             do {
@@ -386,6 +399,17 @@ public nonisolated struct AgentToolExecutor: Sendable {
         await resultDidFinish(ready.invocation.call, final)
         channel.emit(.toolFinished(ready.invocation, final))
         return final
+    }
+
+    private func notDispatched(_ ready: AgentPlannedToolCall.Ready, error: any Error) async -> AgentToolResult {
+        await finish(
+            ready,
+            AgentToolResult(
+                callID: ready.invocation.call.id,
+                content: error is CancellationError
+                    ? AgentInterruptedToolCall.notStartedReason : error.localizedDescription,
+                isError: true,
+                metadata: ["not_dispatched": .bool(true)]))
     }
 }
 

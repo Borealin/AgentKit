@@ -101,9 +101,24 @@ nonisolated struct AgentProviderResponseParser {
                 || root["type"] as? String == "error"
                 || root["type"] as? String == "response.failed"
                 || response?["status"] as? String == "failed"
-                || root["error"] != nil
+                || Self.carriesError(root)
         else { return nil }
         return streamFailure(in: root)
+    }
+
+    /// A frame whose root `error` is an object with a message, code or type,
+    /// or a non-empty string. Gateways that keep the Chat Completions shape
+    /// report a failure after the stream has started this way, with neither
+    /// an SSE event name nor a `type`; skipping the frame would end the
+    /// stream without its reason. A null or empty `error` beside normal
+    /// content is not a failure.
+    private static func carriesError(_ root: [String: Any]) -> Bool {
+        if let text = root["error"] as? String { return !text.isEmpty }
+        guard let error = root["error"] as? [String: Any] else { return false }
+        return ["message", "code", "type"].contains { key in
+            if let value = error[key] as? String { return !value.isEmpty }
+            return error[key] is NSNumber
+        }
     }
 
     private static func streamFailure(in root: [String: Any]) -> AgentProviderStreamFailure {
@@ -113,6 +128,7 @@ nonisolated struct AgentProviderResponseParser {
         let message =
             error?["message"] as? String
             ?? response?["error"] as? String
+            ?? root["error"] as? String
             ?? root["message"] as? String
             ?? String(localized: "The model provider failed to complete the response.", bundle: .module)
         return AgentProviderStreamFailure(code: code, message: message)

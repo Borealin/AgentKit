@@ -191,6 +191,49 @@ struct AgentProviderResponseParserTests {
         #expect(streamReason == .completed)
     }
 
+    @Test(arguments: [false, true])
+    func errorObjectsInChatCompletionsFramesFailTheStream(_ buffered: Bool) throws {
+        let frames = [
+            #"{"error":{"message":"This model's maximum context length is 8192 tokens.","code":"context_length_exceeded"}}"#,
+            #"{"id":"c1","object":"chat.completion.chunk","error":{"code":"server_error","message":"upstream"},"#
+                + #""choices":[{"index":0,"delta":{"content":""},"finish_reason":"error"}]}"#,
+            #"{"error":{"code":400,"message":"The input token count (9000) exceeds the maximum number of tokens allowed (8192)."}}"#,
+            #"{"error":"prompt is too long: 30000 tokens > 16000 maximum"}"#,
+        ]
+        let expected: [(String?, Bool)] = [
+            ("context_length_exceeded", false), ("server_error", true), (nil, false), (nil, false),
+        ]
+        for (frame, (code, retryable)) in zip(frames, expected) {
+            var parser = AgentProviderResponseParser(format: .chatCompletions, wireNames: [:], buffered: buffered)
+            do {
+                _ = try parser.consume(SSEEvent(data: frame))
+                Issue.record("Expected a stream failure for \(frame)")
+            } catch let error as AgentProviderStreamFailure {
+                #expect(error.code == code)
+                #expect(error.isRetryable == retryable)
+                #expect(!error.message.isEmpty)
+                if frame.contains("\"error\":\"") {
+                    // A bare string error keeps its reason (and the limit it states).
+                    #expect(error.message == "prompt is too long: 30000 tokens > 16000 maximum")
+                }
+            }
+        }
+    }
+
+    @Test(arguments: [false, true])
+    func framesWithAnEmptyErrorStayNormal(_ buffered: Bool) throws {
+        var parser = AgentProviderResponseParser(format: .chatCompletions, wireNames: [:], buffered: buffered)
+        let text = try parser.consume(
+            SSEEvent(data: #"{"choices":[{"index":0,"delta":{"content":"hi"}}],"error":null}"#))
+        #expect(text.contains { if case .textDelta("hi") = $0 { true } else { false } })
+        _ = try parser.consume(SSEEvent(data: #"{"choices":[{"index":0,"delta":{"content":"!"}}],"error":{}}"#))
+        _ = try parser.consume(
+            SSEEvent(data: #"{"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}"#))
+        _ = try parser.consume(
+            SSEEvent(data: #"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"error":""}"#))
+        #expect(parser.isTerminated)
+    }
+
     private func parser(_ format: ModelAPIFormat) -> AgentProviderResponseParser {
         AgentProviderResponseParser(format: format, wireNames: ["wire_lookup": "tools.lookup"], buffered: true)
     }

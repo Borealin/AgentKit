@@ -102,12 +102,35 @@ public nonisolated struct AgentProviderClient: AgentModelStreaming, Sendable {
 
     private static let maximumResponseBytes = 16 * 1024 * 1024
 
+    /// Delivers each provider event to `onEvent` on the calling task as soon as
+    /// it is parsed, without collecting an event array.
+    ///
+    /// For maintenance work (summaries, titles) whose result must be bounded
+    /// while it arrives: total transport bytes, one SSE line and the number of
+    /// events are capped by `limits`, and a provider terminal event is required.
+    /// Throwing from `onEvent` stops reading before the next byte is requested
+    /// and cancels the transfer. `stream` and `complete` are unchanged.
+    public func consume(
+        _ request: AgentModelRequest, limits: AgentResponseLimits = .maintenance,
+        onEvent: (AgentModelStreamEvent) throws -> Void
+    ) async throws {
+        var delivered = 0
+        try await receive(request, buffered: true, limits: limits) { event in
+            delivered += 1
+            // More events than allowed is a size limit like total bytes.
+            guard delivered <= limits.maximumEvents else { throw AgentProviderError.responseTooLarge }
+            try onEvent(event)
+        }
+        try Task.checkCancellation()
+    }
+
     /// One transport and provider parser for live events and buffered results.
-    /// Only buffered SSE results have a total byte cap and require a terminal event.
-    /// Parsing state is recreated per request, including provider retries.
+    /// Buffered results and bounded consumers have a total byte cap and require
+    /// a terminal event. Parsing state is recreated per request, including
+    /// provider retries.
     private func receive(
-        _ request: AgentModelRequest, buffered: Bool,
-        emit: (AgentModelStreamEvent) -> Void
+        _ request: AgentModelRequest, buffered: Bool, limits: AgentResponseLimits? = nil,
+        emit: (AgentModelStreamEvent) throws -> Void
     ) async throws {
         try Task.checkCancellation()
         let encoder = requestEncoder
@@ -130,11 +153,12 @@ public nonisolated struct AgentProviderClient: AgentModelStreaming, Sendable {
             )
         }
         let contentType = http.value(forHTTPHeaderField: "Content-Type")?.lowercased() ?? ""
+        let byteLimit = limits?.maximumTransportBytes ?? Self.maximumResponseBytes
         if contentType.contains("application/json") || contentType.contains("+json") {
             var data = Data()
             for try await byte in bytes {
                 try Task.checkCancellation()
-                guard data.count < Self.maximumResponseBytes else {
+                guard data.count < byteLimit else {
                     throw AgentProviderError.responseTooLarge
                 }
                 data.append(byte)
@@ -143,15 +167,16 @@ public nonisolated struct AgentProviderClient: AgentModelStreaming, Sendable {
             if buffered, !parser.isTerminated {
                 throw AgentProviderError.invalidResponse
             }
-            for event in events { emit(event) }
+            for event in events { try emit(event) }
             return
         }
 
         do {
             try await SSEStream.consume(
-                from: bytes, maximumBytes: buffered ? Self.maximumResponseBytes : nil
+                from: bytes, maximumBytes: buffered ? byteLimit : nil,
+                maximumLineBytes: limits?.maximumLineBytes ?? SSEStream.maximumLineBytes
             ) { event in
-                for item in try parser.consume(event) { emit(item) }
+                for item in try parser.consume(event) { try emit(item) }
                 return parser.shouldStop
             }
         } catch SSEStream.ReadError.responseTooLarge {
@@ -268,6 +293,29 @@ nonisolated extension AgentProviderClient {
     ) -> [AgentModelStreamEvent] {
         AgentProviderResponseDecoder.parseGenerateContent(root, wireNames: wireNames)
     }
+}
+
+/// Bounds for `AgentProviderClient.consume`.
+public nonisolated struct AgentResponseLimits: Hashable, Sendable {
+    public init(
+        maximumTransportBytes: Int = 16 * 1_024 * 1_024,
+        maximumLineBytes: Int = 256 * 1_024,
+        maximumEvents: Int = 65_536
+    ) {
+        self.maximumTransportBytes = maximumTransportBytes
+        self.maximumLineBytes = maximumLineBytes
+        self.maximumEvents = maximumEvents
+    }
+
+    /// Total response bytes read from the transport.
+    public var maximumTransportBytes: Int
+    /// One `text/event-stream` line (one SSE `data:` payload line).
+    public var maximumLineBytes: Int
+    /// Parsed provider events delivered to the callback.
+    public var maximumEvents: Int
+
+    /// Defaults for tool-free maintenance responses.
+    public static let maintenance = AgentResponseLimits()
 }
 
 public nonisolated enum AgentProviderError: LocalizedError, Sendable {

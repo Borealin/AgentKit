@@ -186,6 +186,52 @@ struct AgentProviderCompletionTests {
             ])
     }
 
+    /// A Chat Completions gateway reports a failure after the stream started
+    /// as a bare `error` object; live, buffered and bounded paths surface it
+    /// with its code, and a context overflow is not retried.
+    @Test(arguments: ["stream", "consume"])
+    func aBareStringErrorKeepsItsReason(_ path: String) async throws {
+        let body = Self.sse(#"{"error":"prompt is too long: 30000 tokens > 16000 maximum"}"#)
+        let endpoint = CompletionEndpoint(body)
+        defer { endpoint.session.invalidateAndCancel() }
+        let client = endpoint.client(.chatCompletions)
+        do {
+            if path == "stream" {
+                for try await _ in client.stream(Self.request) {}
+            } else {
+                try await client.consume(Self.request, limits: .maintenance) { _ in }
+            }
+            Issue.record("Expected the provider failure to propagate")
+        } catch let error as AgentProviderStreamFailure {
+            #expect(error.message == "prompt is too long: 30000 tokens > 16000 maximum")
+            #expect(error.code == nil && !client.shouldRetry(after: error))
+        }
+    }
+
+    @Test(arguments: ["stream", "complete", "consume"])
+    func aBareErrorObjectAfterTheStreamStartedFailsEveryPath(_ path: String) async throws {
+        let body = Self.sse(
+            #"{"choices":[{"delta":{"content":"部分"}}]}"#,
+            #"{"error":{"message":"This model's maximum context length is 8192 tokens.","code":"context_length_exceeded"}}"#
+        )
+        let endpoint = CompletionEndpoint(body, splitBytes: true)
+        defer { endpoint.session.invalidateAndCancel() }
+        let client = endpoint.client(.chatCompletions)
+        do {
+            switch path {
+            case "stream": for try await _ in client.stream(Self.request) {}
+            case "complete": _ = try await client.complete(Self.request)
+            default: try await client.consume(Self.request, limits: .maintenance) { _ in }
+            }
+            Issue.record("Expected the provider failure to propagate")
+        } catch let error as AgentProviderStreamFailure {
+            #expect(error.code == "context_length_exceeded")
+            #expect(error.message.contains("maximum context length"))
+            #expect(!client.shouldRetry(after: error))
+        }
+        #expect(endpoint.requests.count == 1)
+    }
+
     @Test(arguments: ModelAPIFormat.allCases)
     func everyProviderCompletesUsingStreamingTransport(_ format: ModelAPIFormat) async throws {
         let body: String

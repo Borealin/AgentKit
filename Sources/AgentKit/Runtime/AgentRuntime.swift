@@ -15,6 +15,10 @@ public nonisolated struct AgentLoopConfiguration: Sendable {
     /// Retries transient model-provider failures without replaying tools.
     public var modelRetryPolicy = AgentModelRetryPolicy()
     public var outputProjection = AgentToolOutputProjection()
+    /// Registers the shared scratch tools used by the default output contract.
+    /// Hosts with their own bounded output and explicit capability catalog can
+    /// disable this; tools explicitly present in their registry are retained.
+    public var includesSharedScratchTools = true
     public var contextSnapshot: @Sendable (String?, Bool) -> AgentTurnContextSnapshot = {
         AgentTurnContextSnapshot(sessionContext: $0, planContract: $1 ? AgentPlanContractInjection.contract : nil)
     }
@@ -102,9 +106,11 @@ public actor AgentRuntime {
         channel: AgentEventChannel? = nil
     ) {
         self.model = model
-        self.tools = AgentToolCatalog.registry(
-            builtIn: .init(groups: [], workspace: configuration.outputProjection.workspace),
-            additional: registry.registeredTools)
+        self.tools =
+            configuration.includesSharedScratchTools
+            ? AgentToolCatalog.registry(
+                builtIn: .init(groups: [], workspace: configuration.outputProjection.workspace),
+                additional: registry.registeredTools) : registry
         self.approval = approval
         self.repository = repository
         self.secretBroker = secretBroker
@@ -222,7 +228,6 @@ public actor AgentRuntime {
                     id: runID, state: .running, startedAt: snapshot.startedAt
                 )))
         channel.emit(.runState(.running))
-        await persist(snapshot)
 
         let driver = AgentTurnDriver(
             model: model, tools: availableTools, channel: channel, runID: runID,
@@ -250,6 +255,7 @@ public actor AgentRuntime {
         )
 
         do {
+            try await persist(snapshot)
             for index in 0... {
                 try Task.checkCancellation()
                 channel.emit(.turnStarted(index: index))
@@ -257,7 +263,7 @@ public actor AgentRuntime {
                     let delivered = deliverSteering()
                     snapshot.messages.append(contentsOf: delivered)
                     await evidenceLog.append(GuardianEvidence.collect(from: delivered))
-                    await persist(snapshot)
+                    try await persist(snapshot)
                 }
                 let turn = try await driver.run(
                     pipeline(
@@ -274,7 +280,21 @@ public actor AgentRuntime {
                 // once per turn it survived.
                 if !turn.usage.isEmpty { channel.emit(.usageUpdated(turn.usage)) }
                 channel.emit(.turnFinished(index: index, stopReason: turn.reason))
-                await persist(snapshot)
+                do {
+                    try await persist(snapshot)
+                } catch is CancellationError {
+                    // The completed message is already visible to the host, but
+                    // none of its calls has reached the scheduler. Settle them
+                    // before terminal cleanup drains and saves the transcript.
+                    let results = scheduler.fail(
+                        turn.message.toolCalls, reason: AgentInterruptedToolCall.notStartedReason,
+                        sourceMessageID: turn.message.id)
+                    for (call, result) in zip(turn.message.toolCalls, results) {
+                        snapshot.messages.append(
+                            AgentTranscriptMessage.toolResult(result, runID: runID, toolName: call.name))
+                    }
+                    throw CancellationError()
+                }
 
                 if turn.reason == .error { throw AgentRuntimeError.providerFailed }
                 guard !turn.message.toolCalls.isEmpty else {
@@ -311,7 +331,7 @@ public actor AgentRuntime {
                     snapshot.messages.append(
                         AgentTranscriptMessage.toolResult(result, runID: runID, toolName: call.name))
                 }
-                await persist(snapshot)
+                try await persist(snapshot)
                 if let refusal { throw refusal }
                 // After the results are recorded, not before: a cancelled batch
                 // still leaves the transcript answerable.
@@ -364,21 +384,53 @@ public actor AgentRuntime {
         finished.state = state
         finished.failure = failure
         finished.finishedAt = .now
-        if let failure { channel.emit(.failed(failure)) }
-        channel.emit(
-            .runFinished(
-                AgentRunSummary(
-                    id: finished.id, state: state, startedAt: finished.startedAt,
-                    finishedAt: finished.finishedAt, failure: failure
-                )))
-        channel.emit(.runState(state))
-        await persist(finished)
+        if state == .completed {
+            do {
+                try await persist(finished)
+                try await channel.emitCommitted(
+                    .runFinished(
+                        AgentRunSummary(
+                            id: finished.id, state: .completed, startedAt: finished.startedAt,
+                            finishedAt: finished.finishedAt)))
+            } catch {
+                return await finish(
+                    snapshot, state: error is CancellationError ? .cancelled : .failed,
+                    failure: error is CancellationError ? nil : error.localizedDescription)
+            }
+        } else {
+            // Cleanup outlives cancellation of the running task. Drain accepted
+            // writes, then attempt the failed/cancelled terminal save even when
+            // the drain failed. Real storage errors take precedence over Stop.
+            let terminal = finished
+            finished = await Task {
+                var terminal = terminal
+                do { try await channel.flush() } catch {
+                    if !(terminal.state == .cancelled && error is CancellationError) {
+                        terminal.state = .failed
+                        terminal.failure = error.localizedDescription
+                    }
+                }
+                do { try await repository.save(terminal) } catch {
+                    terminal.state = .failed
+                    terminal.failure = error.localizedDescription
+                }
+                return terminal
+            }.value
+            if let failure = finished.failure { channel.emit(.failed(failure)) }
+            channel.emit(
+                .runFinished(
+                    AgentRunSummary(
+                        id: finished.id, state: finished.state, startedAt: finished.startedAt,
+                        finishedAt: finished.finishedAt, failure: finished.failure)))
+        }
+        channel.emit(.runState(finished.state))
         runTask = nil
         channel.finish()
     }
 
-    private func persist(_ snapshot: AgentRunSnapshot) async {
-        try? await repository.save(snapshot)
+    private func persist(_ snapshot: AgentRunSnapshot) async throws {
+        try await channel.flush()
+        try await repository.save(snapshot)
     }
 }
 
