@@ -184,6 +184,20 @@ Live Chat Completions keep reading after a finish reason because usage may follo
 - **Separate history and model context.** Frozen output projections and host-driven compaction reduce
   model input without replacing display history. The loop has no turn/tool-call count limit; the host decides
   when to invoke `AgentCompactionService` and persist its records.
+- **Awaited commits.** The runtime drains accepted durable events before saving snapshots, requesting
+  another model turn, or dispatching a tool. The first write failure stops further dispatch. A completed
+  snapshot is saved before the completed terminal event is published; cancellation drains accepted
+  writes and saves its terminal snapshot from an uncancelled cleanup task. Failure is still reported
+  when the terminal save itself cannot be written. None of these boundaries replays a tool action.
+
+Hosts with an authoritative transcript writer can pass an async throwing `committing` callback to
+`AgentEventChannel`, then pass that same channel and repository to the runtime. For ordinary `emit`
+events, UI delivery happens first and the callback can await the host's write acknowledgement.
+`flush()` waits for all earlier admitted writes and propagates the first failure. Cancelling a flush
+waiter leaves accepted writes draining. The callback also receives message/steering boundaries,
+without writing every streaming text delta. It must eventually finish or throw, and must not call
+`flush()` recursively on its own channel. For `emitCommitted` (used for successful completion), the
+callback must commit independently of that event's UI delivery: publication waits for the callback.
 
 ## Built-in tools
 

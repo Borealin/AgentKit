@@ -241,6 +241,13 @@ public nonisolated struct AgentToolExecutor: Sendable {
         // re-emitting here would draw it twice.
         guard case .ready(let ready) = planned else { return planned.result }
 
+        do {
+            try await channel.flush()
+            try Task.checkCancellation()
+        } catch {
+            return await notDispatched(ready, error: error)
+        }
+
         let hookDecision = await hooks.willExecute(
             AgentToolCallContext(
                 invocation: ready.invocation, descriptor: ready.descriptor,
@@ -273,6 +280,12 @@ public nonisolated struct AgentToolExecutor: Sendable {
                 ))
         case .allow:
             channel.emit(.toolStarted(ready.invocation))
+            do {
+                try await channel.flush()
+                try Task.checkCancellation()
+            } catch {
+                return await notDispatched(ready, error: error)
+            }
             let gate = AgentToolProgressGate()
             defer { gate.close() }
             do {
@@ -368,6 +381,15 @@ public nonisolated struct AgentToolExecutor: Sendable {
         final.toolPresentation = ready.descriptor.presentation
         channel.emit(.toolFinished(ready.invocation, final))
         return final
+    }
+
+    private func notDispatched(_ ready: AgentPlannedToolCall.Ready, error: any Error) async -> AgentToolResult {
+        await finish(
+            ready,
+            AgentToolResult(
+                callID: ready.invocation.call.id,
+                content: error.localizedDescription, isError: true,
+                metadata: ["not_dispatched": .bool(true)]))
     }
 }
 

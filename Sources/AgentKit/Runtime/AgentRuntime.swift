@@ -223,7 +223,6 @@ public actor AgentRuntime {
                     id: runID, state: .running, startedAt: snapshot.startedAt
                 )))
         channel.emit(.runState(.running))
-        await persist(snapshot)
 
         let driver = AgentTurnDriver(
             model: model, tools: availableTools, channel: channel, runID: runID,
@@ -247,6 +246,7 @@ public actor AgentRuntime {
         )
 
         do {
+            try await persist(snapshot)
             for index in 0... {
                 try Task.checkCancellation()
                 channel.emit(.turnStarted(index: index))
@@ -254,7 +254,7 @@ public actor AgentRuntime {
                     let delivered = deliverSteering()
                     snapshot.messages.append(contentsOf: delivered)
                     await evidenceLog.append(GuardianEvidence.collect(from: delivered))
-                    await persist(snapshot)
+                    try await persist(snapshot)
                 }
                 let turn = try await driver.run(
                     pipeline(
@@ -271,7 +271,7 @@ public actor AgentRuntime {
                 // once per turn it survived.
                 if !turn.usage.isEmpty { channel.emit(.usageUpdated(turn.usage)) }
                 channel.emit(.turnFinished(index: index, stopReason: turn.reason))
-                await persist(snapshot)
+                try await persist(snapshot)
 
                 if turn.reason == .error { throw AgentRuntimeError.providerFailed }
                 guard !turn.message.toolCalls.isEmpty else {
@@ -281,7 +281,7 @@ public actor AgentRuntime {
                     // never shown. Pi keeps its inner loop alive while messages
                     // are pending for exactly this reason; the next iteration
                     // delivers them and asks again.
-                    if steering.isEmpty { return await complete(snapshot, runID: runID) }
+                    if steering.isEmpty { return try await complete(snapshot, runID: runID) }
                     continue
                 }
 
@@ -315,7 +315,7 @@ public actor AgentRuntime {
                         GuardianEvidence.answers(call: call, resultText: result.content)
                     )
                 }
-                await persist(snapshot)
+                try await persist(snapshot)
                 if let refusal { throw refusal }
                 // After the results are recorded, not before: a cancelled batch
                 // still leaves the transcript answerable.
@@ -326,36 +326,13 @@ public actor AgentRuntime {
                         index: index, message: turn.message, results: results
                     ))
                 {
-                    return await complete(snapshot, runID: runID)
+                    return try await complete(snapshot, runID: runID)
                 }
             }
         } catch is CancellationError {
-            acceptsSteering = false
-            snapshot.state = .cancelled
-            snapshot.finishedAt = .now
-            channel.emit(
-                .runFinished(
-                    AgentRunSummary(
-                        id: runID, state: .cancelled, startedAt: snapshot.startedAt,
-                        finishedAt: snapshot.finishedAt
-                    )))
-            channel.emit(.runState(.cancelled))
-            await persist(snapshot)
+            await terminate(snapshot, state: .cancelled, failure: nil)
         } catch {
-            acceptsSteering = false
-            snapshot.state = .failed
-            snapshot.failure = error.localizedDescription
-            snapshot.finishedAt = .now
-            channel.emit(.failed(error.localizedDescription))
-            channel.emit(
-                .runFinished(
-                    AgentRunSummary(
-                        id: runID, state: .failed, startedAt: snapshot.startedAt,
-                        finishedAt: snapshot.finishedAt,
-                        failure: snapshot.failure
-                    )))
-            channel.emit(.runState(.failed))
-            await persist(snapshot)
+            await terminate(snapshot, state: .failed, failure: error.localizedDescription)
         }
         finish(runID: runID)
     }
@@ -384,24 +361,62 @@ public actor AgentRuntime {
         activeContextSnapshot?.toolAvailability?[name] ?? true
     }
 
-    private func complete(_ snapshot: AgentRunSnapshot, runID: UUID) async {
+    private func complete(_ snapshot: AgentRunSnapshot, runID: UUID) async throws {
         acceptsSteering = false
         var finished = snapshot
         finished.state = .completed
         finished.finishedAt = .now
-        channel.emit(
+        try await persist(finished)
+        try await channel.emitCommitted(
             .runFinished(
                 AgentRunSummary(
                     id: runID, state: .completed, startedAt: finished.startedAt,
                     finishedAt: finished.finishedAt
                 )))
         channel.emit(.runState(.completed))
-        await persist(finished)
         finish(runID: runID)
     }
 
-    private func persist(_ snapshot: AgentRunSnapshot) async {
-        try? await repository.save(snapshot)
+    private func persist(_ snapshot: AgentRunSnapshot) async throws {
+        try await channel.flush()
+        try await repository.save(snapshot)
+    }
+
+    /// A failed write must never be reported as successful completion. A
+    /// terminal write may itself fail; still deliver the failure and drain
+    /// the run, rather than retrying side effects or abandoning the reader.
+    private func terminate(_ original: AgentRunSnapshot, state: AgentRunState, failure: String?) async {
+        acceptsSteering = false
+        var snapshot = original
+        snapshot.state = state
+        snapshot.failure = failure
+        snapshot.finishedAt = .now
+        // Cleanup must outlive cancellation of the running task. Drain accepted
+        // events first, then attempt to save even a failed terminal snapshot.
+        // A real write failure wins over cancellation; cancelling a waiter
+        // alone must not turn a user's Stop into a failed run.
+        let terminal = snapshot
+        snapshot = await Task {
+            var terminal = terminal
+            do { try await channel.flush() } catch {
+                if !(terminal.state == .cancelled && error is CancellationError) {
+                    terminal.state = .failed
+                    terminal.failure = error.localizedDescription
+                }
+            }
+            do { try await repository.save(terminal) } catch {
+                terminal.state = .failed
+                terminal.failure = error.localizedDescription
+            }
+            return terminal
+        }.value
+        if let failure = snapshot.failure { channel.emit(.failed(failure)) }
+        channel.emit(
+            .runFinished(
+                AgentRunSummary(
+                    id: snapshot.id, state: snapshot.state,
+                    startedAt: snapshot.startedAt, finishedAt: snapshot.finishedAt, failure: snapshot.failure)))
+        channel.emit(.runState(snapshot.state))
     }
 
     private func finish(runID: UUID) {
