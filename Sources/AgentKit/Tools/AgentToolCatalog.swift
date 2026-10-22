@@ -18,6 +18,7 @@ public nonisolated struct AgentToolGroup: RawRepresentable, Hashable, Sendable {
     public init(rawValue: String) { self.rawValue = rawValue }
     public init(_ rawValue: String) { self.rawValue = rawValue }
 
+    /// Compatibility label only: scratch is mandatory regardless of selected groups.
     /// `scratch_list`, `scratch_read`, `scratch_search`, `scratch_write`,
     /// `scratch_replace`, `scratch_copy`, `scratch_move`, `scratch_diff`,
     /// `scratch_delete`. Needs a workspace.
@@ -65,17 +66,13 @@ nonisolated
 /// "no fetcher" is a model that was never told `fetch` existed.
 public nonisolated struct AgentBuiltInToolConfiguration: Sendable {
     public var groups: Set<AgentToolGroup>
-    /// Per conversation rather than per run, so a file staged before the user
-    /// interrupted is still there for the run that answers them.
+    /// Shared device-local workspace. Scratch is always available.
     public var workspace: AgentScratchWorkspace?
     public var web: (any AgentWebFetching)?
     /// Separate from `web` because most providers now search on their own
     /// servers; a run using native search supplies a fetcher and no searcher,
     /// and `web_search` is then simply absent rather than present and redundant.
     public var search: (any AgentWebSearching)?
-    /// The tools allowed to spend a secret handle — see
-    /// `RequestUserSecretTool.consumerTools`. Empty accepts any name.
-    public var secretConsumerTools: [String] = []
     public var tasks: AgentTaskList?
     public var plans: AgentPlanRecorder?
     /// Snapshotted for the run by the caller — see `AgentSkillCatalog`.
@@ -96,7 +93,6 @@ public nonisolated struct AgentBuiltInToolConfiguration: Sendable {
         workspace: AgentScratchWorkspace? = nil,
         web: (any AgentWebFetching)? = nil,
         search: (any AgentWebSearching)? = nil,
-        secretConsumerTools: [String] = [],
         tasks: AgentTaskList? = nil,
         plans: AgentPlanRecorder? = nil,
         skills: AgentSkillCatalog = AgentSkillCatalog(),
@@ -112,10 +108,9 @@ public nonisolated struct AgentBuiltInToolConfiguration: Sendable {
         mcpClient: MCPClient = MCPClient()
     ) {
         self.groups = groups
-        self.workspace = workspace
+        self.workspace = workspace ?? .shared()
         self.web = web
         self.search = search
-        self.secretConsumerTools = secretConsumerTools
         self.tasks = tasks
         self.plans = plans
         self.skills = skills
@@ -206,14 +201,8 @@ public nonisolated enum AgentToolCatalog {
             return WebSearchTool(web: search)
         },
         .init(ScratchFetchTool.self) { configuration in
-            // Both groups, not just a workspace that happens to exist. This tool
-            // is a fetch whose result lands in the staging area, so an app that
-            // took `.web` without `.scratch` asked for pages in the transcript
-            // and would get files it has no other tool to read.
-            guard configuration.includes(.web), let web = configuration.web,
-                let workspace = configuration.scratch
-            else { return nil }
-            return ScratchFetchTool(workspace: workspace, web: web)
+            guard configuration.includes(.web), let web = configuration.web else { return nil }
+            return ScratchFetchTool(workspace: configuration.scratch, web: web)
         },
     ]
 
@@ -223,20 +212,20 @@ public nonisolated enum AgentToolCatalog {
         },
         .init(RequestUserSecretTool.self) { configuration in
             guard configuration.includes(.userInteraction) else { return nil }
-            return RequestUserSecretTool(consumerTools: configuration.secretConsumerTools)
+            return RequestUserSecretTool()
         },
     ]
 
     private static let scratchTools: [Registration] = [
-        .init(ScratchListTool.self) { $0.scratch.map(ScratchListTool.init(workspace:)) },
-        .init(ScratchReadTool.self) { $0.scratch.map(ScratchReadTool.init(workspace:)) },
-        .init(ScratchSearchTool.self) { $0.scratch.map(ScratchSearchTool.init(workspace:)) },
-        .init(ScratchWriteTool.self) { $0.scratch.map(ScratchWriteTool.init(workspace:)) },
-        .init(ScratchReplaceTool.self) { $0.scratch.map(ScratchReplaceTool.init(workspace:)) },
-        .init(ScratchCopyTool.self) { $0.scratch.map(ScratchCopyTool.init(workspace:)) },
-        .init(ScratchMoveTool.self) { $0.scratch.map(ScratchMoveTool.init(workspace:)) },
-        .init(ScratchDiffTool.self) { $0.scratch.map(ScratchDiffTool.init(workspace:)) },
-        .init(ScratchDeleteTool.self) { $0.scratch.map(ScratchDeleteTool.init(workspace:)) },
+        .init(ScratchListTool.self) { ScratchListTool(workspace: $0.scratch) },
+        .init(ScratchReadTool.self) { ScratchReadTool(workspace: $0.scratch) },
+        .init(ScratchSearchTool.self) { ScratchSearchTool(workspace: $0.scratch) },
+        .init(ScratchWriteTool.self) { ScratchWriteTool(workspace: $0.scratch) },
+        .init(ScratchReplaceTool.self) { ScratchReplaceTool(workspace: $0.scratch) },
+        .init(ScratchCopyTool.self) { ScratchCopyTool(workspace: $0.scratch) },
+        .init(ScratchMoveTool.self) { ScratchMoveTool(workspace: $0.scratch) },
+        .init(ScratchDiffTool.self) { ScratchDiffTool(workspace: $0.scratch) },
+        .init(ScratchDeleteTool.self) { ScratchDeleteTool(workspace: $0.scratch) },
     ]
 
     /// Presenters for tools that have since been renamed.
@@ -351,9 +340,9 @@ nonisolated
 
     extension AgentBuiltInToolConfiguration
 {
-    /// The workspace, but only when the scratch group asked for it.
-    fileprivate var scratch: AgentScratchWorkspace? {
-        includes(.scratch) ? workspace : nil
+    /// Scratch is mandatory; the legacy group selection no longer gates it.
+    fileprivate var scratch: AgentScratchWorkspace {
+        workspace ?? .shared()
     }
 }
 

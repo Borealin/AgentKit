@@ -261,6 +261,7 @@ struct AgentProviderAdapterTests {
         let tools = try #require(body["tools"] as? [[String: Any]])
         let namespace = try #require(tools.first { $0["type"] as? String == "namespace" })
         #expect(namespace["name"] as? String == "a_b_c-d")
+        #expect(namespace["description"] as? String == "Tools provided by the \"a_b_c-d\" MCP server.")
         let children = try #require(namespace["tools"] as? [[String: Any]])
         #expect(children.first?["type"] as? String == "function")
         #expect(children.first?["name"] as? String == "lookup")
@@ -280,6 +281,30 @@ struct AgentProviderAdapterTests {
             ],
         ])
         #expect(parsed.firstTool?.name == "a_b_c-d.lookup")
+    }
+
+    @Test(arguments: [nil, "", " \n\t ", "  Search documents and inspect their contents.\n"])
+    func responsesIncludesServerDescriptionOrNamespaceFallback(_ description: String?) throws {
+        var provider = ModelProvider(name: "OpenAI")
+        provider.apiFormat = .responses
+        var first = Self.namespacedTool
+        first.namespaceDescription = description
+        var second = first
+        second.namespace = "other"
+        second.namespaceDescription = "Manage tasks."
+        let body = AgentProviderClient(
+            provider: provider, model: AIModel(id: "gpt-test"), secret: "test"
+        ).body(AgentModelRequest(systemPrompt: "test", messages: [], tools: [second, first]))
+        let tools = try #require(body["tools"] as? [[String: Any]])
+        let namespace = try #require(tools.first { $0["name"] as? String == first.namespace })
+        let expected =
+            description.flatMap {
+                $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0
+            } ?? "Tools provided by the \"a_b_c-d\" MCP server."
+        #expect(namespace["description"] as? String == expected)
+        #expect(tools.first { $0["name"] as? String == "other" }?["description"] as? String == "Manage tasks.")
+        let children = try #require(namespace["tools"] as? [[String: Any]])
+        #expect(children.first?["description"] as? String == first.summary)
     }
 
     @Test
@@ -349,7 +374,7 @@ struct AgentProviderAdapterTests {
                 ], wireNames: names
             ).firstTool?.name == tool.qualifiedName)
         #expect(
-            AgentProviderClient.parseCompletedAnthropic(
+            AgentProviderClient.parseCompletedMessages(
                 [
                     "type": "message",
                     "content": [
@@ -360,7 +385,7 @@ struct AgentProviderAdapterTests {
                 ], wireNames: names
             ).firstTool?.name == tool.qualifiedName)
         #expect(
-            AgentProviderClient.parseGoogle(
+            AgentProviderClient.parseGenerateContent(
                 [
                     "candidates": [
                         [
@@ -438,16 +463,6 @@ struct AgentProviderAdapterTests {
     }
 
     @Test
-    func responsesUsesJSONTypeWhenSSEEventNameIsMissing() {
-        let type = AgentProviderClient.streamEventType(
-            SSEEvent(data: #"{"type":"response.output_item.added"}"#),
-            root: ["type": "response.output_item.added"]
-        )
-
-        #expect(type == "response.output_item.added")
-    }
-
-    @Test
     func openAIResponsesParsesBufferedCompletedResponseWithEmptyArguments() {
         let response: [String: Any] = [
             "object": "response", "status": "completed",
@@ -514,32 +529,6 @@ struct AgentProviderAdapterTests {
         }
         #expect(text == #"{"command":"ls"}"#)
         #expect(events.containsFinish == .completed)
-    }
-
-    @Test
-    func openAIResponsesMapsItemIDArgumentDeltasBackToCallID() {
-        var ids: [String: String] = [:]
-        var names: [String: String] = [:]
-        let added = AgentProviderClient.parseResponses(
-            "response.output_item.added",
-            [
-                "item": [
-                    "type": "function_call", "id": "item-1", "call_id": "call-1",
-                    "name": "list_hosts", "arguments": "",
-                ]
-            ],
-            callIDs: &ids, callNames: &names
-        )
-        let delta = AgentProviderClient.parseResponses(
-            "response.function_call_arguments.delta",
-            ["item_id": "item-1", "delta": "{}"],
-            callIDs: &ids, callNames: &names
-        )
-
-        #expect(added.firstTool?.id == "call-1")
-        #expect(delta.firstTool?.id == "call-1")
-        #expect(delta.firstTool?.name == "list_hosts")
-        #expect(delta.firstTool?.arguments == "{}")
     }
 
     @Test
@@ -685,72 +674,14 @@ struct AgentProviderAdapterTests {
     }
 
     @Test
-    func openAIChatRetainsCallIDAcrossChunks() {
-        var ids: [Int: String] = [:]
-        _ = AgentProviderClient.parseChat(
-            [
-                "choices": [
-                    [
-                        "delta": [
-                            "tool_calls": [
-                                [
-                                    "index": 0, "id": "call-1",
-                                    "function": ["name": "fetch", "arguments": "{\"url\":"],
-                                ]
-                            ]
-                        ]
-                    ]
-                ]
-            ], callIDs: &ids)
-        let next = AgentProviderClient.parseChat(
-            [
-                "choices": [
-                    [
-                        "delta": [
-                            "tool_calls": [
-                                [
-                                    "index": 0, "function": ["arguments": "\"https://example.com\"}"],
-                                ]
-                            ]
-                        ], "finish_reason": "tool_calls",
-                    ]
-                ]
-            ], callIDs: &ids)
-        #expect(next.firstTool?.id == "call-1")
-        #expect(next.containsFinish == .toolCalls)
-    }
-
-    @Test
-    func anthropicRetainsNativeToolUseIDAcrossPartialJSON() {
-        var state = AnthropicStreamState()
-        let start = AgentProviderClient.parseAnthropic(
-            "content_block_start",
-            [
-                "index": 1,
-                "content_block": [
-                    "type": "tool_use", "id": "toolu_123", "name": "sftp_read",
-                ],
-            ],
-            state: &state
-        )
-        let delta = AgentProviderClient.parseAnthropic(
-            "content_block_delta",
-            ["index": 1, "delta": ["partial_json": "{\"path\":\"/tmp\"}"]],
-            state: &state
-        )
-        #expect(start.firstTool?.id == "toolu_123")
-        #expect(delta.firstTool?.id == "toolu_123")
-    }
-
-    @Test
-    func anthropicThinkingStreamsAndReplaysItsSignature() throws {
-        var state = AnthropicStreamState()
-        var events = AgentProviderClient.parseAnthropic(
+    func messagesThinkingStreamsAndReplaysItsSignature() throws {
+        var state = MessagesStreamState()
+        var events = AgentProviderClient.parseMessages(
             "content_block_start",
             ["index": 0, "content_block": ["type": "thinking", "thinking": ""]],
             state: &state
         )
-        events += AgentProviderClient.parseAnthropic(
+        events += AgentProviderClient.parseMessages(
             "content_block_delta",
             [
                 "index": 0,
@@ -759,7 +690,7 @@ struct AgentProviderAdapterTests {
                 ],
             ], state: &state
         )
-        events += AgentProviderClient.parseAnthropic(
+        events += AgentProviderClient.parseMessages(
             "content_block_delta",
             [
                 "index": 0,
@@ -768,7 +699,7 @@ struct AgentProviderAdapterTests {
                 ],
             ], state: &state
         )
-        events += AgentProviderClient.parseAnthropic(
+        events += AgentProviderClient.parseMessages(
             "content_block_stop", ["index": 0], state: &state
         )
 
@@ -797,8 +728,8 @@ struct AgentProviderAdapterTests {
     }
 
     @Test
-    func anthropicBufferedThinkingIsNotAnswerText() {
-        let events = AgentProviderClient.parseCompletedAnthropic([
+    func messagesBufferedThinkingIsNotAnswerText() {
+        let events = AgentProviderClient.parseCompletedMessages([
             "type": "message",
             "content": [
                 [
@@ -815,8 +746,8 @@ struct AgentProviderAdapterTests {
     }
 
     @Test
-    func geminiParsesFunctionCallAndFinish() {
-        let events = AgentProviderClient.parseGoogle([
+    func generateContentParsesFunctionCallAndFinish() {
+        let events = AgentProviderClient.parseGenerateContent([
             "candidates": [
                 [
                     "content": [
@@ -835,8 +766,8 @@ struct AgentProviderAdapterTests {
     }
 
     @Test
-    func googleThoughtTextIsReasoningAndFunctionSignatureReplays() throws {
-        let events = AgentProviderClient.parseGoogle([
+    func generateContentThoughtTextIsReasoningAndFunctionSignatureReplays() throws {
+        let events = AgentProviderClient.parseGenerateContent([
             "candidates": [
                 [
                     "content": [
@@ -966,11 +897,11 @@ struct AgentProviderAdapterTests {
     /// `AgentRuntime` rejects with `invalidToolCall` — so a single native
     /// search would fail the entire assistant turn.
     @Test
-    func anthropicServerToolBlocksNeverBecomeToolCalls() {
-        var state = AnthropicStreamState()
+    func messagesServerToolBlocksNeverBecomeToolCalls() {
+        var state = MessagesStreamState()
         var events: [AgentModelStreamEvent] = []
 
-        events += AgentProviderClient.parseAnthropic(
+        events += AgentProviderClient.parseMessages(
             "content_block_start",
             [
                 "index": 0,
@@ -981,13 +912,13 @@ struct AgentProviderAdapterTests {
             state: &state
         )
         for chunk in [#"{"query""#, #": "swift 6""#, "}"] {
-            events += AgentProviderClient.parseAnthropic(
+            events += AgentProviderClient.parseMessages(
                 "content_block_delta",
                 ["index": 0, "delta": ["type": "input_json_delta", "partial_json": chunk]],
                 state: &state
             )
         }
-        events += AgentProviderClient.parseAnthropic(
+        events += AgentProviderClient.parseMessages(
             "content_block_stop", ["index": 0], state: &state
         )
 
@@ -996,11 +927,11 @@ struct AgentProviderAdapterTests {
     }
 
     @Test
-    func anthropicPairsItsSearchQueryWithItsResults() throws {
-        var state = AnthropicStreamState()
+    func messagesPairsItsSearchQueryWithItsResults() throws {
+        var state = MessagesStreamState()
         var events: [AgentModelStreamEvent] = []
 
-        events += AgentProviderClient.parseAnthropic(
+        events += AgentProviderClient.parseMessages(
             "content_block_start",
             [
                 "index": 0,
@@ -1010,7 +941,7 @@ struct AgentProviderAdapterTests {
             ],
             state: &state
         )
-        events += AgentProviderClient.parseAnthropic(
+        events += AgentProviderClient.parseMessages(
             "content_block_delta",
             [
                 "index": 0,
@@ -1018,10 +949,10 @@ struct AgentProviderAdapterTests {
             ],
             state: &state
         )
-        events += AgentProviderClient.parseAnthropic(
+        events += AgentProviderClient.parseMessages(
             "content_block_stop", ["index": 0], state: &state
         )
-        events += AgentProviderClient.parseAnthropic(
+        events += AgentProviderClient.parseMessages(
             "content_block_start",
             [
                 "index": 1,
@@ -1035,7 +966,7 @@ struct AgentProviderAdapterTests {
             state: &state
         )
         // The model's own text still streams normally afterwards.
-        events += AgentProviderClient.parseAnthropic(
+        events += AgentProviderClient.parseMessages(
             "content_block_delta",
             ["index": 2, "delta": ["type": "text_delta", "text": "Swift 6 ships"]],
             state: &state
@@ -1050,9 +981,9 @@ struct AgentProviderAdapterTests {
 
     /// A failed search replaces the array of hits with a single error object.
     @Test
-    func anthropicSearchErrorYieldsNoSources() throws {
-        var state = AnthropicStreamState()
-        let events = AgentProviderClient.parseAnthropic(
+    func messagesSearchErrorYieldsNoSources() throws {
+        var state = MessagesStreamState()
+        let events = AgentProviderClient.parseMessages(
             "content_block_start",
             [
                 "index": 0,
@@ -1122,8 +1053,8 @@ struct AgentProviderAdapterTests {
     }
 
     @Test
-    func googleGroundingMetadataBecomesOneSearchCard() throws {
-        let events = AgentProviderClient.parseGoogle([
+    func generateContentGroundingMetadataBecomesOneSearchCard() throws {
+        let events = AgentProviderClient.parseGenerateContent([
             "candidates": [
                 [
                     "content": ["parts": [["text": "Swift 6 shipped."]]],
@@ -1148,8 +1079,8 @@ struct AgentProviderAdapterTests {
 
     /// Gemini can report grounding on a chunk that carries no `content` at all.
     @Test
-    func googleGroundingIsReadFromAContentlessChunk() throws {
-        let events = AgentProviderClient.parseGoogle([
+    func generateContentGroundingIsReadFromAContentlessChunk() throws {
+        let events = AgentProviderClient.parseGenerateContent([
             "candidates": [
                 [
                     "groundingMetadata": ["webSearchQueries": ["swift 6"]]

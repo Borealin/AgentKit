@@ -3,6 +3,7 @@ import Foundation
 /// One dynamically discovered MCP definition. Remote metadata may describe the
 /// call but can never contribute an executable detail presenter.
 public nonisolated struct MCPAgentTool: AgentTool {
+    public var truncateStrategy: AgentTruncateStrategy { .middle }
     private let server: MCPServer
     private let tool: MCPTool
     private let bearerToken: String?
@@ -20,6 +21,7 @@ public nonisolated struct MCPAgentTool: AgentTool {
         descriptor = AgentToolDescriptor(
             name: name,
             namespace: server.effectiveNamespaceID,
+            namespaceDescription: server.serverDescription,
             summary: "\(server.name): \(tool.summary)",
             inputSchema: AgentMCPTools.normalizedSchema(tool.inputSchema), target: .mcp,
             // Remote read-only annotations are hints, never local proof. The
@@ -33,7 +35,7 @@ public nonisolated struct MCPAgentTool: AgentTool {
                         namespace: server.effectiveNamespaceID, function: name
                     )),
                 output: .json,
-                actionKind: .run
+                actionKind: .call
             )
         )
     }
@@ -65,7 +67,7 @@ public nonisolated struct MCPAgentTool: AgentTool {
             server, tool: tool.id, arguments: invocation.call.arguments,
             bearerToken: bearerToken, interaction: interaction
         )
-        return AgentToolResult(
+        let result = AgentToolResult(
             callID: invocation.call.id,
             content: "<untrusted-data>\n\(called.value.encodedString)\n</untrusted-data>",
             isError: called.isError,
@@ -74,6 +76,11 @@ public nonisolated struct MCPAgentTool: AgentTool {
                 "mcp_tool": .string(tool.id),
             ]
         )
+        let conversationID = (context.conversationID ?? context.runID).uuidString.lowercased()
+        let toolName = descriptor.name.replacingOccurrences(of: "_", with: "-")
+        return await context.makeOutputAccumulator {
+            "\(conversationID)/outputs/\(toolName)-\(UUID().uuidString.lowercased()).txt"
+        }.capturing(result)
     }
 }
 

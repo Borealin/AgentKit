@@ -1,6 +1,6 @@
 # AgentKit
 
-[English](README.md) · [简体中文（中国）](README.zh-CN.md) · [正體中文（臺灣）](README.zh-TW.md) · **日本語**
+[Deutsch](README.de.md) · [English](README.md) · [Français](README.fr.md) · **日本語** · [한국어](README.ko.md) · [简体中文（中国）](README.zh-CN.md) · [正體中文（臺灣）](README.zh-TW.md)
 
 ツールの実行管理、明示的な権限制御、永続的な会話状態を備えたAIエージェントをSwiftで構築できます。
 
@@ -17,7 +17,7 @@ AgentKitがモデルとツールの実行ループ、承認、会話状態を管
 パッケージの依存関係を追加します。
 
 ```swift
-.package(url: "https://github.com/AkinoKaede/AgentKit.git", from: "0.16.0")
+.package(url: "https://github.com/AkinoKaede/AgentKit.git", from: "4.0.0")
 ```
 
 次に、ターゲットにコアのプロダクトを追加します。
@@ -31,7 +31,7 @@ AgentKitがモデルとツールの実行ループ、承認、会話状態を管
 
 ## 使い方
 
-次の例ではResponsesエンドポイントを使用し、会話専用の一時ワークスペースを操作するツールだけを有効にします。
+次の例ではResponsesエンドポイントと、常に有効な共有Scratchツールを使用します。
 非同期コンテキストから呼び出し、アプリの認証情報ストアから取得したAPIキーと、承認UIを表示して
 `.allow`または`.deny(reason)`を返す`manualApproval`クロージャを渡してください。
 
@@ -52,19 +52,19 @@ func runAgent(
         baseURL: "https://api.openai.com/v1"
     )
     let model = AIModel(id: "gpt-4.1-mini", abilities: [.toolCall])
-    let workspace = AgentScratchWorkspace(
-        conversationID: conversationID,
-        applicationName: "MyApp"
-    )
+    let workspace = AgentScratchWorkspace.shared(applicationName: "MyApp")
+    var configuration = AgentLoopConfiguration()
+    configuration.outputProjection = AgentToolOutputProjection(workspace: workspace)
     let runtime = AgentRuntime(
         model: AgentProviderClient(provider: provider, model: model, secret: apiKey),
         registry: AgentToolCatalog.registry(
             builtIn: AgentBuiltInToolConfiguration(
-                groups: [.scratch],
+                groups: [],
                 workspace: workspace
             )
         ),
-        approval: AgentApprovalBroker(reviewer: nil, manualApproval: manualApproval)
+        approval: AgentApprovalBroker(reviewer: nil, manualApproval: manualApproval),
+        configuration: configuration
     )
     let request = AgentRunRequest(
         conversationID: conversationID,
@@ -113,6 +113,24 @@ Guardianのレビュー担当が未設定でも`.askForApproval`には影響し�
   `AgentSystemPrompt.default`も含めてください。
 
 ## アーキテクチャ
+
+各 `AgentToolDetailPresenter` の `layout: AgentToolDetailLayout` で表示方針を登録します。
+`singleLineHeader` と `boundsApprovalHeight` はそれぞれ単一行の見出しと承認詳細の高さ制限を指定し、
+`truncateStrategy` は表示専用の折りたたみに `head`、`tail`、`middle`、`none` を選びます。
+既定値は通常の見出し、自然な承認領域の高さ、`head` です。`.compact` は両方のレイアウト指定を有効にします。
+ホストはツール名で分岐せず、登録済みの設定を `AgentToolDetail(items:layout:)` に渡します。
+メタデータのテキストブロックを `isCollapsible: false` にすると、位置に関係なくプレビューの制限対象外になります。
+承認引数は常に全文を読めます。設定は信頼されたローカルの presenter レジストリから解決し、MCP の内容からは
+受け取りません。モデル向けの切り詰め、保存ファイル、切り詰めマーカーには影響しません。
+
+```swift
+static let presenter = AgentToolDetailPresenter(
+    id: "example.logs",
+    layout: .init(singleLineHeader: true, boundsApprovalHeight: true, truncateStrategy: .tail),
+    present: present,
+    presentArguments: presentArguments
+)
+```
 
 `AgentRuntime`は実行全体を調整します。プロバイダやツールの実装をすべて抱えるクラスではありません。
 1回の実行に属するタスク、会話履歴のスナップショット、追加指示のキュー、イベントチャネルを管理し、
@@ -192,8 +210,8 @@ Guardianのレビュー担当が未設定でも`.askForApproval`には影響し�
 
 | グループ | ツール | 依存サービス |
 | --- | --- | --- |
-| `.scratch` | `scratch_list`, `scratch_read`, `scratch_search`, `scratch_write`, `scratch_replace`, `scratch_copy`, `scratch_move`, `scratch_diff`, `scratch_delete` | `workspace: AgentScratchWorkspace` |
-| `.web` | `fetch`, `web_search`, `scratch_fetch` | 取得には`web: AgentWebFetching`、検索には`search: AgentWebSearching`が必要。`scratch_fetch`にはさらに`.scratch`とワークスペースが必要 |
+| 常に有効 | `scratch_list`, `scratch_read`, `scratch_search`, `scratch_write`, `scratch_replace`, `scratch_copy`, `scratch_move`, `scratch_diff`, `scratch_delete` | `workspace: AgentScratchWorkspace` |
+| `.web` | `fetch`, `web_search`, `scratch_fetch` | `web: AgentWebFetching`, `search: AgentWebSearching` |
 | `.userInteraction` | `request_user_input`, `request_user_secret` | カタログへの依存はなし。ランタイムにユーザ操作のハンドラを渡す |
 | `.planning` | `present_plan` | ワークスペースと`plans: AgentPlanRecorder` |
 | `.tasks` | `manage_tasks` | `tasks: AgentTaskList`。`.acting`の実行でのみ利用可能 |
@@ -256,8 +274,7 @@ let webTools = AgentBuiltInToolConfiguration(
 ```
 
 この設定を`AgentToolCatalog.registry(builtIn:)`に渡します。`web:`だけを指定した場合は取得が有効になりますが、
-`web_search`は有効になりません。`search:`は独立した依存サービスです。`scratch_fetch`を有効にするには、
-`.scratch`も選択し、ワークスペースを渡してください。
+`web_search`は有効になりません。`search:`は独立した依存サービスです。`scratch_fetch`は共有ワークスペースを自動的に使用します。
 
 プロバイダとモデルがネイティブ検索に対応している場合は、代わりに`AgentProviderClient(webSearch:)`を
 `true`に設定し、`search:`を省略できます。先に`ModelProvider.supportsNativeWebSearch(model:)`を確認してください。
@@ -312,10 +329,55 @@ Guardianは分離された`.reviewing`モードで動作し、デフォルトで
 上限のある形で複数の実行にわたって保持し、メインの会話には混ぜません。
 
 ユーザが入力したシークレットは、消去可能な`AgentSecret`ストレージと`SecretBroker`を通じて扱われます。
-実行、ツール、用途に紐付けられた一度限りのハンドルで受け渡され、平文はモデル入力、レビュー、イベント、
-永続化の対象から除外されます。ツールの出力は信頼しないデータとして扱います。
+`issue(secret)`で保存し、一度限りのハンドルを`consume(handle)`に渡して取り出します。
+呼び出し元がbrokerのライフサイクルを管理し、複数の実行で共有して、スコープの終了時に`discardAll()`で消去します。
+`request_user_secret`は`prompt`、ユーザに表示する`purpose`、省略可能な`timeout_seconds`を受け取り、
+`secret_handle`と`single_use`を返します。平文はモデル入力、レビュー、イベント、永続化の対象から除外されます。
+ツールの出力は信頼しないデータとして扱います。
 限定的な例外は、インストール済みスキルの`SKILL.md`です。手順を提供することはできますが、
 権限を与えることはできません。その補助ファイルは引き続き信頼しない参照データとして扱います。
+
+## 共有Scratchとツール出力
+
+Scratchは必須機能で、同じデバイスの同じアプリ内の全会話で共有されます。`AgentScratchWorkspace.shared(applicationName:)`で得た同じコーディネーターをツール設定と`AgentLoopConfiguration.outputProjection`に渡してください。ルートはApplication Support / applicationName / Scratchで、会話IDは追加されません。会話の削除や分岐はファイルを削除・複製しません。AIは作業別の相対パスを選び、上書き前に既存ファイルを確認します。親ディレクトリは自動作成され、パスとシンボリックリンクの検証は維持されます。
+
+`AgentTruncateStrategy`は`head`（既定）、`tail`、`middle`、`none`に対応します。`AgentTruncateLimits`の既定値は64 KiB（65,536 UTF-8バイト）と2,000論理行です。長すぎる単一行も途中では切りません。モデル投影にはJSONエスケープと外側のフィールドの容量も含めます。ページ読み取りは実際の次のオフセットを保ち、accumulatorや追加の保存ファイルを作成しません。
+
+保存はツールごとの任意機能で、モデル引数やScratchの有効化スイッチではありません。以下のファクトリーにはScratchからの完全な相対パスを返すクロージャを渡し、保存が必要な時だけ呼び出します。ディレクトリとファイル名はツールが決めます。AgentKitは接頭辞や拡張子を強制せず、親ディレクトリの作成と境界の検証を行い、同名ファイルを上書きしません。推奨規則は`<conversationID>/outputs/<tool-name>-<UUID>.txt`（アンダースコアをハイフンに変換）です。これは整理規則であり、会話の隔離ではありません。conversationIDがない場合はrunIDを使用できます。外部MCPの保存には呼び出したツール名を使います。累積スナップショットは同じファイルを更新します。非ストリーミングツールは`await accumulator.capturing(result)`を使用できます。
+
+AgentKitが翻訳しない2種類のマーカーを生成します。保存成功時は`[Showing lines <start>-<end> of <total>. Full output: <path>]`、それ以外は`[Showing lines <start>-<end> of <total>]`です。保存エラーと続きのoffset/cursorは別の結果フィールドに保持し、マーカーは増やしません。UIの折りたたみは独立し、切り詰めマーカーもファイルも生成しません。表示側は実際の切り詰め時に確定した`AgentToolResult.truncateMarker`を表示できます。外部MCPの結果は`middle`と保存を使用し、外部クライアントへの応答にはモデルの切り詰めやScratch保存を適用しません。
+
+```swift
+let conversationID = (context.conversationID ?? context.runID).uuidString.lowercased()
+let accumulator = context.makeOutputAccumulator {
+    "\(conversationID)/outputs/my-tool-\(UUID().uuidString.lowercased()).txt"
+}
+accumulator.append(Data("one complete line\n".utf8))
+let snapshot = await accumulator.snapshot()
+// snapshot.output, snapshot.capture?.path, snapshot.capture?.error
+```
+
+Scratchにはファイルサイズ、ワークスペース容量、ファイル数の固定上限はありません。accumulatorは完全な出力をメモリに保持し、累積スナップショットをアトミックに置き換えます。ディスクへのストリーミング保存ではありません。`snapshot(capturePath:)`でツール指定のパスに独立したスナップショットを保存できます。書き込み失敗は`capture.error`で報告します。
+
+マーカーはPiの行範囲形式を参考にしています。`middle`は保持した2つの範囲を列挙し、総行数が不明なら`of <total>`を省略します。長すぎる単一行では`[Showing 0 of 1 lines]`になる場合があります。保存成功時だけ`Full output: <path>`を追加します。
+
+### 組み込みツールの出力ポリシー
+
+| ツール / 結果 | 方式 | 自動保存 |
+| --- | --- | --- |
+| `fetch`, `web_search` | `head` | あり |
+| MCP | `middle` | あり |
+| `scratch_read`, `skill_read_file` | `head`、ページ分割 | なし |
+| `read_chat` | `head`、ページ分割 | なし |
+| `scratch_search` | `head` | なし |
+| その他の組み込みツール | `head` | なし |
+| 外部クライアントへの応答 | 適用しない | なし |
+
+`scratch_fetch`は主処理として呼び出し側の指定先へ書き込みます。切り詰め時の自動保存ではありません。結果件数やページ範囲などの取得元の制限は維持されます。信頼されたインストール済み`SKILL.md`の指示には個別のインポート・検証制限を適用します。
+
+### 1.xからの移行
+
+カタログと出力投影には同じ共有workspaceを使用してください。`.scratch`は互換用グループ名として残りますが、ツールを無効化しません。カタログのworkspaceがnilなら`.shared()`を使用します。`AgentToolOutputProjection.workspace`は非Optionalとなるため、明示的な`nil`を共有workspaceに変更してください。旧workspaceの`conversationID`引数はディレクトリを選択せず、`copyScope`も何もしません。既存の会話フォルダーは通常の相対パスディレクトリとして残るため、旧ファイルを読む際は元のフォルダー名を含めます。会話とともに共有Scratchを削除しないでください。自動保存が必要なツールはaccumulatorを使用します。出力投影はすべての超過結果を自動保存しなくなります。
 
 ## AgentKitの拡張
 
@@ -346,11 +408,11 @@ Guardianは分離された`.reviewing`モードで動作し、デフォルトで
 
 ## ローカライズ
 
-ユーザ向けの文字列は`Localizations/Localizable.xcstrings`にあり、英語、簡体字中国語、繁体字中国語、日本語に対応しています。
+ユーザ向けの文字列は`Localizations/Localizable.xcstrings`にあり、英語、ドイツ語、フランス語、日本語、韓国語、簡体字中国語、繁体字中国語に対応しています。
 `Scripts/build-localizations.sh`で`Sources/AgentKit/Resources/*.lproj`にコンパイルします。
 カタログを編集した後は、このスクリプトを再実行し、生成されたリソースもコミットしてください。
 `swift build`はリソースをコピーするだけで、文字列カタログのコンパイルは行いません。
-`python3 Scripts/check-cjk-localization.py`で、中国語と日本語の翻訳の網羅性、書式引数、間隔を検証できます。
+`python3 Scripts/check-localization.py`で、6言語の翻訳の網羅性、書式引数、複数形、各言語の空白規則を検証できます。
 
 ツールカードのテキストは、描画時に閲覧者のロケールで解決されます。そのため、記録済みのカードを別の言語で表示できます。
 

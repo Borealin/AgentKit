@@ -133,11 +133,12 @@ public nonisolated struct AgentProviderClient: AgentModelStreaming, Sendable {
         emit: (AgentModelStreamEvent) throws -> Void
     ) async throws {
         try Task.checkCancellation()
-        let toolNames = AgentProviderToolNameMap.flat(request.tools)
+        let encoder = requestEncoder
+        let prepared = encoder.prepare(request, streaming: true)
         var parser = AgentProviderResponseParser(
-            format: provider.apiFormat, wireNames: toolNames.wireToQualified, buffered: buffered
+            format: provider.apiFormat, wireNames: prepared.toolNames.wireToQualified, buffered: buffered
         )
-        var urlRequest = try buildRequest(request, streaming: true)
+        var urlRequest = try encoder.buildRequest(prepared)
         try await ProviderNetworking.authorize(
             &urlRequest, provider: provider, secret: secret, omittingEmptyCredential: true
         )
@@ -270,27 +271,27 @@ nonisolated extension AgentProviderClient {
         AgentProviderResponseDecoder.parseChat(root, callIDs: &callIDs, wireNames: wireNames)
     }
 
-    public static func parseCompletedAnthropic(
+    public static func parseCompletedMessages(
         _ root: [String: Any], wireNames: [String: String] = [:]
     ) -> [AgentModelStreamEvent] {
-        AgentProviderResponseDecoder.parseCompletedAnthropic(root, wireNames: wireNames)
+        AgentProviderResponseDecoder.parseCompletedMessages(root, wireNames: wireNames)
     }
 
-    public static func parseAnthropic(_ type: String, _ root: [String: Any]) -> [AgentModelStreamEvent] {
-        AgentProviderResponseDecoder.parseAnthropic(type, root)
+    public static func parseMessages(_ type: String, _ root: [String: Any]) -> [AgentModelStreamEvent] {
+        AgentProviderResponseDecoder.parseMessages(type, root)
     }
 
-    public static func parseAnthropic(
-        _ type: String, _ root: [String: Any], state: inout AnthropicStreamState,
+    public static func parseMessages(
+        _ type: String, _ root: [String: Any], state: inout MessagesStreamState,
         wireNames: [String: String] = [:]
     ) -> [AgentModelStreamEvent] {
-        AgentProviderResponseDecoder.parseAnthropic(type, root, state: &state, wireNames: wireNames)
+        AgentProviderResponseDecoder.parseMessages(type, root, state: &state, wireNames: wireNames)
     }
 
-    public static func parseGoogle(
+    public static func parseGenerateContent(
         _ root: [String: Any], wireNames: [String: String] = [:]
     ) -> [AgentModelStreamEvent] {
-        AgentProviderResponseDecoder.parseGoogle(root, wireNames: wireNames)
+        AgentProviderResponseDecoder.parseGenerateContent(root, wireNames: wireNames)
     }
 }
 

@@ -8,7 +8,7 @@ nonisolated struct AgentProviderResponseParser {
     let buffered: Bool
 
     private var chatCallIDs: [Int: String] = [:]
-    private var anthropicState = AnthropicStreamState()
+    private var messagesState = MessagesStreamState()
     private var responseCallIDs: [String: String] = [:]
     private var responseCallNames: [String: String] = [:]
     private var reachedEndMarker = false
@@ -37,9 +37,7 @@ nonisolated struct AgentProviderResponseParser {
         }
         // Gateways commonly omit the SSE event field and use the JSON type.
         let eventType = AgentProviderResponseDecoder.streamEventType(event, root: root)
-        if eventType == "error" || eventType == "response.failed" || Self.carriesError(root) {
-            throw Self.streamFailure(in: root)
-        }
+        if let failure = Self.explicitFailure(in: root, eventType: eventType) { throw failure }
         let events: [AgentModelStreamEvent]
         switch format {
         case .responses:
@@ -52,11 +50,11 @@ nonisolated struct AgentProviderResponseParser {
         case .chatCompletions:
             events = AgentProviderResponseDecoder.parseChat(root, callIDs: &chatCallIDs, wireNames: wireNames)
         case .messages:
-            events = AgentProviderResponseDecoder.parseAnthropic(
-                eventType, root, state: &anthropicState, wireNames: wireNames
+            events = AgentProviderResponseDecoder.parseMessages(
+                eventType, root, state: &messagesState, wireNames: wireNames
             )
         case .generateContent:
-            events = AgentProviderResponseDecoder.parseGoogle(root, wireNames: wireNames)
+            events = AgentProviderResponseDecoder.parseGenerateContent(root, wireNames: wireNames)
         }
         recordTermination(in: events)
         return events
@@ -71,8 +69,9 @@ nonisolated struct AgentProviderResponseParser {
             switch format {
             case .responses: events = AgentProviderResponseDecoder.parseCompletedResponses(root)
             case .chatCompletions: events = AgentProviderResponseDecoder.parseChat(root, wireNames: wireNames)
-            case .messages: events = AgentProviderResponseDecoder.parseCompletedAnthropic(root, wireNames: wireNames)
-            case .generateContent: events = AgentProviderResponseDecoder.parseGoogle(root, wireNames: wireNames)
+            case .messages: events = AgentProviderResponseDecoder.parseCompletedMessages(root, wireNames: wireNames)
+            case .generateContent:
+                events = AgentProviderResponseDecoder.parseGenerateContent(root, wireNames: wireNames)
             }
             recordTermination(in: events)
             return events
@@ -93,13 +92,16 @@ nonisolated struct AgentProviderResponseParser {
         }
     }
 
-    private static func explicitFailure(in root: [String: Any]) -> AgentProviderStreamFailure? {
+    private static func explicitFailure(
+        in root: [String: Any], eventType: String? = nil
+    ) -> AgentProviderStreamFailure? {
         let response = root["response"] as? [String: Any]
         guard
-            root["type"] as? String == "error"
+            eventType == "error" || eventType == "response.failed"
+                || root["type"] as? String == "error"
                 || root["type"] as? String == "response.failed"
                 || response?["status"] as? String == "failed"
-                || root["error"] != nil
+                || Self.carriesError(root)
         else { return nil }
         return streamFailure(in: root)
     }

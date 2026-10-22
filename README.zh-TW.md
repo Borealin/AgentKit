@@ -1,6 +1,6 @@
 # AgentKit
 
-[English](README.md) · [简体中文（中国）](README.zh-CN.md) · **正體中文（臺灣）** · [日本語](README.ja.md)
+[Deutsch](README.de.md) · [English](README.md) · [Français](README.fr.md) · [日本語](README.ja.md) · [한국어](README.ko.md) · [简体中文（中国）](README.zh-CN.md) · **正體中文（臺灣）**
 
 以 Swift 打造 AI 代理，整合工具協調、明確的權限控管與持久保存的對話狀態。
 
@@ -16,7 +16,7 @@
 加入套件相依項目：
 
 ```swift
-.package(url: "https://github.com/AkinoKaede/AgentKit.git", from: "0.16.0")
+.package(url: "https://github.com/AkinoKaede/AgentKit.git", from: "4.0.0")
 ```
 
 接著將核心產品加入目標：
@@ -30,7 +30,7 @@
 
 ## 使用方式
 
-以下範例使用 Responses 端點，僅啟用目前對話的私有暫存區工具。
+以下範例使用 Responses 端點和一律提供的共用暫存區工具。
 請在非同步情境中呼叫，從應用程式的認證資訊儲存區提供 API 金鑰，並傳入 `manualApproval` 閉包：
 由閉包顯示核准介面，回傳 `.allow` 或 `.deny(reason)`。
 
@@ -51,19 +51,19 @@ func runAgent(
         baseURL: "https://api.openai.com/v1"
     )
     let model = AIModel(id: "gpt-4.1-mini", abilities: [.toolCall])
-    let workspace = AgentScratchWorkspace(
-        conversationID: conversationID,
-        applicationName: "MyApp"
-    )
+    let workspace = AgentScratchWorkspace.shared(applicationName: "MyApp")
+    var configuration = AgentLoopConfiguration()
+    configuration.outputProjection = AgentToolOutputProjection(workspace: workspace)
     let runtime = AgentRuntime(
         model: AgentProviderClient(provider: provider, model: model, secret: apiKey),
         registry: AgentToolCatalog.registry(
             builtIn: AgentBuiltInToolConfiguration(
-                groups: [.scratch],
+                groups: [],
                 workspace: workspace
             )
         ),
-        approval: AgentApprovalBroker(reviewer: nil, manualApproval: manualApproval)
+        approval: AgentApprovalBroker(reviewer: nil, manualApproval: manualApproval),
+        configuration: configuration
     )
     let request = AgentRunRequest(
         conversationID: conversationID,
@@ -109,6 +109,23 @@ func runAgent(
   `AgentSystemPrompt.default`。
 
 ## 架構
+
+透過每個 `AgentToolDetailPresenter` 的 `layout: AgentToolDetailLayout` 註冊展示策略。
+`singleLineHeader` 與 `boundsApprovalHeight` 分別宣告單行標題與核准詳情高度限制；`truncateStrategy`
+為純展示摺疊選擇 `head`、`tail`、`middle` 或 `none`。預設使用一般標題、自然核准高度與 `head`；
+`.compact` 同時啟用兩項版面提示。宿主將註冊的版面傳入 `AgentToolDetail(items:layout:)`，不要依工具名稱
+分支。中繼資料文字區塊設定 `isCollapsible: false`，無論位於何處都不占正文預覽預算。核准參數始終可以
+完整閱讀。版面只從可信的本機 presenter 註冊表解析，不接受 MCP 承載內容中的設定。這些策略不改變模型
+截斷、儲存檔案或截斷 marker。
+
+```swift
+static let presenter = AgentToolDetailPresenter(
+    id: "example.logs",
+    layout: .init(singleLineHeader: true, boundsApprovalHeight: true, truncateStrategy: .tail),
+    present: present,
+    presentArguments: presentArguments
+)
+```
 
 `AgentRuntime` 是協調器，而不是把模型介接與工具實作集中在一起的龐大元件。
 它管理一次執行的工作、對話快照、引導訊息佇列與事件通道，將各階段委派給可獨立測試的元件。
@@ -183,8 +200,8 @@ Anthropic 的獨立快取計數則另外處理。即時 Chat Completions 收到�
 
 | 工具群組 | 工具 | 相依項目 |
 | --- | --- | --- |
-| `.scratch` | `scratch_list`、`scratch_read`、`scratch_search`、`scratch_write`、`scratch_replace`、`scratch_copy`、`scratch_move`、`scratch_diff`、`scratch_delete` | `workspace: AgentScratchWorkspace` |
-| `.web` | `fetch`、`web_search`、`scratch_fetch` | 擷取需要 `web: AgentWebFetching`；搜尋需要 `search: AgentWebSearching`；`scratch_fetch` 還需要 `.scratch` 與暫存區 |
+| 一律提供 | `scratch_list`、`scratch_read`、`scratch_search`、`scratch_write`、`scratch_replace`、`scratch_copy`、`scratch_move`、`scratch_diff`、`scratch_delete` | `workspace: AgentScratchWorkspace` |
+| `.web` | `fetch`、`web_search`、`scratch_fetch` | `web: AgentWebFetching`, `search: AgentWebSearching` |
 | `.userInteraction` | `request_user_input`、`request_user_secret` | 無工具目錄相依項目；需要提供 runtime 的使用者互動處理器 |
 | `.planning` | `present_plan` | 暫存區與 `plans: AgentPlanRecorder` |
 | `.tasks` | `manage_tasks` | `tasks: AgentTaskList`；僅限行動模式 |
@@ -209,8 +226,11 @@ Anthropic 的獨立快取計數則另外處理。即時 Chat Completions 收到�
   安裝過程不會執行指令稿。
 - `AgentMemoryAccessing` 提供隨需記憶檢索與已儲存對話搜尋。
   在上下文管線中使用 `AgentMemoryContext` 只注入可撤銷的檢索策略，不注入記憶內文。
-  `memory_search` 傳回有界的完整項目。`AgentMemoryLearningService` 根據有界參考資料提出
-  經過驗證的更新，由主應用程式決定何時審查與套用。
+  `memory_search` 傳回有界的完整項目。詞彙搜尋會將自然語言問題拆分為搜尋詞（包含中文詞語），
+  先尋找符合所有有效搜尋詞的項目，僅在沒有結果時擴大至符合任一搜尋詞的項目。
+  它不會推斷同義詞，也不會進行跨語言翻譯。`AgentSearchQuery` 與主應用程式的 `session_search`
+  儲存區共用這套查詢解析與安全的 FTS5 搜尋詞引號處理。`AgentMemoryLearningService` 根據有界參考資料
+  提出經過驗證的更新，由主應用程式決定何時審查與套用。
 
 工具註冊與上下文注入彼此獨立：透過 `AgentTurnContextSnapshot.skillCatalog` 傳入已啟用技能目錄的
 `catalogBlock`，模型就能探索適用流程，而不必載入所有技能內文。
@@ -241,7 +261,7 @@ let webTools = AgentBuiltInToolConfiguration(
 ```
 
 將設定傳給 `AgentToolCatalog.registry(builtIn:)`。只提供 `web:` 會啟用網頁擷取，**不會**啟用
-`web_search`；`search:` 是獨立的相依項目。若要啟用 `scratch_fetch`，還需選擇 `.scratch` 並提供暫存區。
+`web_search`；`search:` 是獨立的相依項目。`scratch_fetch` 自動使用共用暫存區。
 
 若服務供應商與模型支援原生搜尋，可以將 `AgentProviderClient(webSearch:)` 設為 `true`，並省略 `search:`。
 請先檢查 `ModelProvider.supportsNativeWebSearch(model:)`；協定相容不代表閘道實作了伺服器端搜尋。
@@ -291,10 +311,56 @@ Guardian 在隔離的 `.reviewing` 模式下執行，預設不註冊調查工具
 `ReviewerReadOnlyApproval` 只允許已標記為 `.approve` 的呼叫，且沒有升級核准途徑，避免遞迴審查。
 `GuardianSessionStore` 在多次執行之間保存有界的授權基準與決定，不會將它們混入主對話。
 
-使用者輸入的機密值透過可清除的 `AgentSecret` 儲存空間和 `SecretBroker`，以一次性控制代碼傳遞，並繫結至執行個體、工具與用途；
-明文不會進入模型輸入、審查、事件與持久儲存紀錄。工具輸出一律視為不可信資料。
+使用者輸入的機密值透過可清除的 `AgentSecret` 儲存空間和 `SecretBroker`，以一次性控制代碼傳遞。
+透過 `issue(secret)` 存入機密值，透過 `consume(handle)` 取出一次。呼叫端管理 broker 的生命週期，
+可在多次執行間共用，並在其作用域結束時呼叫 `discardAll()` 清理。
+`request_user_secret` 接收 `prompt`、向使用者顯示的 `purpose` 和選填的 `timeout_seconds`，
+傳回 `secret_handle` 和 `single_use`。明文不會進入模型輸入、審查、事件與持久儲存紀錄。
+工具輸出一律視為不可信資料。
 唯一的有限例外是已安裝技能的 `SKILL.md`：它可以提供操作流程，但不能授予權限；
 輔助檔案仍是不可信的參考資料。
+
+## 共用暫存區與工具輸出
+
+Scratch 是必要能力，同一裝置上同一應用程式內的所有對話共用。`AgentScratchWorkspace.shared(applicationName:)` 傳回同一個協調器，工具設定與 `AgentLoopConfiguration.outputProjection` 應使用同一實例。根目錄為 Application Support / applicationName / Scratch，不再附加對話 ID；刪除或分支對話不會刪除或複製檔案。AI 必須主動選擇與任務相關的相對路徑，覆寫前檢查現有檔案。缺少的父目錄會自動建立，路徑和符號連結檢查仍有效。
+
+`AgentTruncateStrategy` 支援 `head`（預設）、`tail`、`middle` 和 `none`。`AgentTruncateLimits` 預設為 64 KiB（65,536 UTF-8 位元組）及 2,000 個邏輯行，不截斷半行；單行超限時也不傳回不完整的行。模型投影包含 JSON 跳脫和外層欄位的開銷。分頁讀取保留實際的下一偏移量，不建立 accumulator，也不將讀取的分頁再次存檔。
+
+存檔由工具選擇採用，不是模型參數，也不是 Scratch 開關。下方通用工廠接收完整 Scratch 相對路徑的產生閉包，僅在需要存檔時呼叫。目錄與檔名由工具決定；AgentKit 不強制前綴或副檔名，只自動建立父目錄、驗證路徑邊界並避免覆寫同名檔案。工具建議使用 `<conversationID>/outputs/<tool-name>-<UUID>.txt`（工具名中的底線改為連字號）；這是檔案組織慣例，不是對話隔離。沒有 conversationID 的呼叫環境可以使用 runID。外部 MCP 的存檔使用被呼叫工具的名稱。連續快照重用同一檔案；非串流工具可呼叫 `await accumulator.capturing(result)`。
+
+AgentKit 統一產生兩種不翻譯的 marker：成功存檔使用 `[Showing lines <start>-<end> of <total>. Full output: <path>]`，其餘情況使用 `[Showing lines <start>-<end> of <total>]`。存檔錯誤與續讀 offset/cursor 保留在獨立結果欄位中，不增加 marker。UI 摺疊獨立，既不產生截斷 marker，也不觸發存檔。呈現層可顯示實際截斷時凍結的 `AgentToolResult.truncateMarker`。呼叫外部 MCP 的回傳值使用 `middle` 並存檔；外部用戶端呼叫本機工具時不套用模型截斷，也不建立 Scratch 輸出。
+
+```swift
+let conversationID = (context.conversationID ?? context.runID).uuidString.lowercased()
+let accumulator = context.makeOutputAccumulator {
+    "\(conversationID)/outputs/my-tool-\(UUID().uuidString.lowercased()).txt"
+}
+accumulator.append(Data("one complete line\n".utf8))
+let snapshot = await accumulator.snapshot()
+// snapshot.output, snapshot.capture?.path, snapshot.capture?.error
+```
+
+Scratch 不設定單一檔案大小、工作區總容量或檔案數量配額。accumulator 在記憶體中保留完整輸出，並以不可分割的操作替換累積快照，不是磁碟串流儲存。`snapshot(capturePath:)` 可依工具指定的路徑儲存獨立快照。寫入失敗會回報 `capture.error`，不宣稱已儲存完整副本。
+
+Marker 參考 Pi 的行範圍格式。`middle` 列出保留的兩段範圍；總行數未知時省略 `of <total>`；超長單行可能得到 `[Showing 0 of 1 lines]`。僅成功存檔時附加 `Full output: <path>`。
+
+### 內建工具輸出策略
+
+| 工具 / 結果 | 策略 | 自動存檔 |
+| --- | --- | --- |
+| `fetch`, `web_search` | `head` | 是 |
+| MCP | `middle` | 是 |
+| `scratch_read`, `skill_read_file` | `head`，分頁 | 否 |
+| `read_chat` | `head`，分頁 | 否 |
+| `scratch_search` | `head` | 否 |
+| 其他內建工具 | `head` | 否 |
+| 傳回外部用戶端的結果 | 略過 | 否 |
+
+`scratch_fetch` 的主要操作是寫入呼叫端指定的目標路徑，而非自動截斷存檔。結果數量、分頁範圍等來源端限制仍有效。可信任的已安裝 `SKILL.md` 指令使用獨立的匯入與驗證限制。
+
+### 從 1.x 遷移
+
+工具目錄與輸出投影應使用同一個共用 workspace。`.scratch` 僅保留為相容的群組標籤，不再控制工具開關；工具設定的 workspace 為 nil 時回退至 `.shared()`。`AgentToolOutputProjection.workspace` 不再可選，請將明確指定的 `nil` 改為共用 workspace。舊 workspace 的 `conversationID` 參數不再選取目錄，`copyScope` 不再執行操作。現有對話資料夾保留原位，成為一般的相對路徑目錄；讀取舊檔案時需加上原目錄名稱。不要隨對話刪除共用 Scratch。需要自動存檔的工具必須採用 accumulator，輸出投影不再為所有超限結果自動存檔。
 
 ## 擴充 AgentKit
 
@@ -323,10 +389,10 @@ Guardian 在隔離的 `.reviewing` 模式下執行，預設不註冊調查工具
 
 ## 在地化
 
-使用者介面的字串位於 `Localizations/Localizable.xcstrings`，包含英文、簡體中文、正體中文與日文，
+使用者介面的字串位於 `Localizations/Localizable.xcstrings`，包含英文、德文、法文、日文、韓文、簡體中文與正體中文，
 由 `Scripts/build-localizations.sh` 編譯至 `Sources/AgentKit/Resources/*.lproj`。
 修改字串目錄後，需重新執行指令稿並提交產生的資源；`swift build` 只複製資源，不會編譯字串目錄。
-執行 `python3 Scripts/check-cjk-localization.py` 可檢查中日文翻譯的完整性、格式參數與間距。
+執行 `python3 Scripts/check-localization.py` 可統一檢查六種譯文的完整性、格式參數、複數與各語言的間距規範。
 
 工具卡片會在呈現時依閱讀者的地區設定解析文字，因此已記錄的卡片也能以另一種語言顯示。
 

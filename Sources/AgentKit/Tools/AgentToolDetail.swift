@@ -4,12 +4,15 @@ import Foundation
 /// It deliberately contains no SwiftUI types or executable persisted state.
 public nonisolated struct AgentToolDetail: Equatable, Sendable {
     public init(
-        items: [Item]
+        items: [Item],
+        layout: AgentToolDetailLayout = .init()
     ) {
         self.items = items
+        self.layout = layout
     }
 
     public var items: [Item]
+    public var layout: AgentToolDetailLayout
 
     public nonisolated enum Item: Equatable, Sendable {
         case field(Field)
@@ -58,16 +61,20 @@ public nonisolated struct AgentToolDetail: Equatable, Sendable {
         public init(
             title: String? = nil,
             text: String,
-            style: TextStyle
+            style: TextStyle,
+            isCollapsible: Bool = true
         ) {
             self.title = title
             self.text = text
             self.style = style
+            self.isCollapsible = isCollapsible
         }
 
         public var title: String?
         public var text: String
         public var style: TextStyle
+        /// False for metadata that must stay visible outside the host's preview budget.
+        public var isCollapsible: Bool
     }
 
     public nonisolated struct ListRow: Equatable, Sendable {
@@ -152,16 +159,20 @@ public nonisolated struct AgentToolDetailInput: Sendable {
     public init(
         result: AgentJSONValue,
         arguments: [String: AgentJSONValue],
-        locale: Locale
+        locale: Locale,
+        isFailure: Bool = false
     ) {
         self.result = result
         self.arguments = arguments
         self.locale = locale
+        self.isFailure = isFailure
     }
 
     public var result: AgentJSONValue
     public var arguments: [String: AgentJSONValue]
     public var locale: Locale
+    /// Includes denied or interrupted execution even when historical payload fields look successful.
+    public var isFailure: Bool
 }
 
 /// The arguments a person reviews before allowing a tool to run.
@@ -187,14 +198,18 @@ public nonisolated struct AgentToolArgumentDetailInput: Sendable {
 /// Only the built-in catalog constructs these; remote tools cannot register code.
 public nonisolated struct AgentToolDetailPresenter: Sendable {
     public let id: String
+    public let layout: AgentToolDetailLayout
     private let projection: @Sendable (AgentToolDetailInput) -> [AgentToolDetail.Item]
     private let argumentProjection: (@Sendable (AgentToolArgumentDetailInput) -> [AgentToolDetail.Item])?
+    private let operation: (@Sendable ([String: AgentJSONValue]) -> AgentToolOperation?)?
 
     public init(
         id: String,
+        layout: AgentToolDetailLayout = .init(),
         present: @escaping @Sendable (AgentToolDetailInput) -> [AgentToolDetail.Item],
         presentArguments:
-            (@Sendable (AgentToolArgumentDetailInput) -> [AgentToolDetail.Item])? = nil
+            (@Sendable (AgentToolArgumentDetailInput) -> [AgentToolDetail.Item])? = nil,
+        operation: (@Sendable ([String: AgentJSONValue]) -> AgentToolOperation?)? = nil
     ) {
         // Namespaced, not `builtin.`-prefixed. The ID is persisted with the card
         // and looked up years later against a registry the host composed from
@@ -207,8 +222,14 @@ public nonisolated struct AgentToolDetailPresenter: Sendable {
             "Detail presenter IDs must be namespaced, as in \"builtin.fetch\""
         )
         self.id = id
+        self.layout = layout
         projection = present
         argumentProjection = presentArguments
+        self.operation = operation
+    }
+
+    public func resolveOperation(arguments: [String: AgentJSONValue]) -> AgentToolOperation? {
+        operation?(arguments)
     }
 
     public func present(_ input: AgentToolDetailInput) -> [AgentToolDetail.Item] {

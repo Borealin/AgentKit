@@ -30,8 +30,8 @@
 	<string>%lldか所を置換しました</string>
 	<key>%lld tasks · %lld completed</key>
 	<string>%1$lld件のタスク · %2$lld件完了</string>
-	<key>A skill may be at most %lld KB.</key>
-	<string>スキルのサイズは%lld KB以下にしてください。</string>
+	<key>A skill may be at most %@.</key>
+	<string>スキルのサイズは%@以下にしてください。</string>
 	<key>A skill name may be at most %lld characters.</key>
 	<string>スキル名は%lld文字以内にしてください。</string>
 	<key>A skill name may not begin or end with a hyphen.</key>
@@ -338,7 +338,7 @@
 	<string>実行中</string>
 	<key>SHA-256</key>
 	<string>SHA-256</string>
-	<key>SSE (legacy)</key>
+	<key>SSE (Legacy)</key>
 	<string>SSE（旧方式）</string>
 	<key>Same as Chat</key>
 	<string>チャットと同じ</string>
@@ -474,8 +474,6 @@
 	<string>秘密鍵を読み取れませんでした：%@。</string>
 	<key>The run was cancelled before this tool ran.</key>
 	<string>このツールが実行される前に、今回の実行がキャンセルされました。</string>
-	<key>The secret is not valid for this host, tool, or purpose.</key>
-	<string>このシークレットは、このホスト、ツール、用途には使用できません。</string>
 	<key>The secret is unavailable or has already been used.</key>
 	<string>このシークレットは利用できないか、すでに使用されています。</string>
 	<key>The selected file window is not UTF-8 text.</key>
@@ -580,8 +578,6 @@
 	<string>ワークスペース</string>
 	<key>Workspace is empty</key>
 	<string>ワークスペースは空です</string>
-	<key>Workspace usage</key>
-	<string>ワークスペースの使用状況</string>
 	<key>Write skill file</key>
 	<string>スキルのファイルを書き込む</string>
 	<key>Yes</key>

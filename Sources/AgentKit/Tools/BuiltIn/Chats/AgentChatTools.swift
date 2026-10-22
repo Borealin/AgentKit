@@ -243,7 +243,7 @@ private nonisolated enum AgentChatToolPresentation {
 
 public nonisolated struct ListModelsTool: AgentToolDefinition, AgentToolSchemaBuilding {
     public static let presenter = AgentToolDetailPresenter(
-        id: "builtin.list_models", present: AgentChatToolPresentation.models,
+        id: "builtin.list_models", layout: .compact, present: AgentChatToolPresentation.models,
         presentArguments: { _ in [] })
     let catalog: any AgentChatModelCatalog
     public init(catalog: any AgentChatModelCatalog) { self.catalog = catalog }
@@ -272,12 +272,11 @@ public nonisolated struct ListModelsTool: AgentToolDefinition, AgentToolSchemaBu
 
 private nonisolated protocol AgentChatTool: AgentToolDefinition, AgentToolSchemaBuilding {
     var coordinator: any AgentChatCoordinating { get }
-    var source: AgentChatSourceContext { get }
 }
 
 public nonisolated struct CreateNewChatTool: AgentChatTool {
     public static let presenter = AgentToolDetailPresenter(
-        id: "builtin.create_new_chat", present: AgentChatToolPresentation.oneChat,
+        id: "builtin.create_new_chat", layout: .compact, present: AgentChatToolPresentation.oneChat,
         presentArguments: { _ in [] })
     let coordinator: any AgentChatCoordinating
     let source: AgentChatSourceContext
@@ -312,13 +311,11 @@ public nonisolated struct CreateNewChatTool: AgentChatTool {
 
 public nonisolated struct ListChatsTool: AgentChatTool {
     public static let presenter = AgentToolDetailPresenter(
-        id: "builtin.list_chats", present: AgentChatToolPresentation.chats,
+        id: "builtin.list_chats", layout: .compact, present: AgentChatToolPresentation.chats,
         presentArguments: { _ in [] })
     let coordinator: any AgentChatCoordinating
-    let source: AgentChatSourceContext
-    public init(coordinator: any AgentChatCoordinating, source: AgentChatSourceContext) {
+    public init(coordinator: any AgentChatCoordinating, source _: AgentChatSourceContext) {
         self.coordinator = coordinator
-        self.source = source
     }
     public var descriptor: AgentToolDescriptor {
         Self.descriptor(
@@ -343,13 +340,11 @@ public nonisolated struct ListChatsTool: AgentChatTool {
 
 public nonisolated struct ReadChatTool: AgentChatTool {
     public static let presenter = AgentToolDetailPresenter(
-        id: "builtin.read_chat", present: AgentChatToolPresentation.read,
+        id: "builtin.read_chat", layout: .compact, present: AgentChatToolPresentation.read,
         presentArguments: AgentChatToolPresentation.safeArguments)
     let coordinator: any AgentChatCoordinating
-    let source: AgentChatSourceContext
-    public init(coordinator: any AgentChatCoordinating, source: AgentChatSourceContext) {
+    public init(coordinator: any AgentChatCoordinating, source _: AgentChatSourceContext) {
         self.coordinator = coordinator
-        self.source = source
     }
     public var descriptor: AgentToolDescriptor {
         Self.descriptor(
@@ -365,16 +360,18 @@ public nonisolated struct ReadChatTool: AgentChatTool {
         -> AgentToolResult
     {
         let arguments = try Arguments(invocation)
-        return Self.result(
+        var result = Self.result(
             invocation,
             try await coordinator.readChat(
                 id: try arguments.chatID("chat_id"), cursor: arguments.optionalString("cursor")))
+        result.hasBoundedModelContent = true
+        return result
     }
 }
 
 public nonisolated struct SendToChatTool: AgentChatTool {
     public static let presenter = AgentToolDetailPresenter(
-        id: "builtin.send_to_chat", present: AgentChatToolPresentation.oneChat,
+        id: "builtin.send_to_chat", layout: .compact, present: AgentChatToolPresentation.oneChat,
         presentArguments: AgentChatToolPresentation.safeArguments)
     let coordinator: any AgentChatCoordinating
     let source: AgentChatSourceContext
@@ -407,7 +404,7 @@ public nonisolated struct SendToChatTool: AgentChatTool {
 
 public nonisolated struct WaitChatsTool: AgentChatTool {
     public static let presenter = AgentToolDetailPresenter(
-        id: "builtin.wait_chats", present: AgentChatToolPresentation.wait,
+        id: "builtin.wait_chats", layout: .compact, present: AgentChatToolPresentation.wait,
         presentArguments: { _ in [] })
     let coordinator: any AgentChatCoordinating
     let source: AgentChatSourceContext

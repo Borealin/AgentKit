@@ -13,7 +13,7 @@ public nonisolated struct ScratchListTool: AgentToolDefinition, AgentToolSchemaB
     public var descriptor: AgentToolDescriptor {
         Self.descriptor(
             "scratch_list",
-            "List the private scratch workspace and report its quota usage.",
+            "List files and directories in the shared device-local scratch workspace.",
             properties: [
                 "path": Self.string(max: AgentScratchWorkspace.Limits.pathBytes),
                 "recursive": Self.boolean(),
@@ -33,7 +33,6 @@ public nonisolated struct ScratchListTool: AgentToolDefinition, AgentToolSchemaB
             arguments.optionalString("path"),
             recursive: arguments.optionalBool("recursive") ?? false
         )
-        let usage = try await workspace.usage()
         return Self.result(
             invocation,
             .object([
@@ -44,11 +43,7 @@ public nonisolated struct ScratchListTool: AgentToolDefinition, AgentToolSchemaB
                             "bytes": .number(Double(entry.bytes)),
                             "modified_at": entry.modifiedAt.map { .string($0.ISO8601Format()) } ?? .null,
                         ])
-                    }),
-                "total_bytes": .number(Double(usage.bytes)),
-                "byte_quota": .number(Double(usage.byteQuota)),
-                "entry_count": .number(Double(usage.entries)),
-                "entry_quota": .number(Double(usage.entryQuota)),
+                    })
             ]))
     }
 }
@@ -110,7 +105,6 @@ public nonisolated struct ScratchSearchTool: AgentToolDefinition, AgentToolSchem
     }
 
     public static let presenter = AgentToolDetailPresenter(id: "builtin.scratch_search", present: present)
-    private static let contentBytes = 128 * 1_024
     public let workspace: AgentScratchWorkspace
 
     public var descriptor: AgentToolDescriptor {
@@ -141,15 +135,9 @@ public nonisolated struct ScratchSearchTool: AgentToolDefinition, AgentToolSchem
             caseSensitive: arguments.optionalBool("case_sensitive"),
             limit: arguments.optionalInt("limit") ?? 20
         )
-        var returned = outcome.matches
-        var truncated = outcome.isTruncated
-        var payload = Self.payload(outcome, matches: returned, truncated: truncated)
-        while payload.encodedString.utf8.count > Self.contentBytes, !returned.isEmpty {
-            returned.removeLast()
-            truncated = true
-            payload = Self.payload(outcome, matches: returned, truncated: truncated)
-        }
-        return Self.result(invocation, payload, truncated: truncated)
+        return Self.result(
+            invocation, Self.payload(outcome, matches: outcome.matches, truncated: outcome.isTruncated),
+            truncated: outcome.isTruncated)
     }
 
     private static func payload(
@@ -184,7 +172,8 @@ public nonisolated struct ScratchWriteTool: AgentToolDefinition, AgentToolSchema
 
     public var descriptor: AgentToolDescriptor {
         Self.descriptor(
-            "scratch_write", "Create or overwrite a scratch file.",
+            "scratch_write",
+            "Create or overwrite a shared scratch file. Choose a task-specific relative path and check for existing files before overwriting. Missing parent directories are created automatically.",
             properties: [
                 "path": Self.string(max: AgentScratchWorkspace.Limits.pathBytes),
                 "content": Self.string(max: 128 * 1_024),
@@ -213,8 +202,6 @@ public nonisolated struct ScratchWriteTool: AgentToolDefinition, AgentToolSchema
             .object([
                 "path": .string(written.path), "bytes": .number(Double(written.bytes)),
                 "sha256": .string(written.sha256), "created": .bool(written.didCreate),
-                "total_bytes": .number(Double(written.usage.bytes)),
-                "byte_quota": .number(Double(written.usage.byteQuota)),
             ]))
     }
 }
@@ -295,7 +282,6 @@ public nonisolated struct ScratchReplaceTool: AgentToolDefinition, AgentToolSche
                 "diff": .string(outcome.diff.text), "diff_truncated": .bool(outcome.diff.isTruncated),
                 "bytes": .number(Double(outcome.bytes)), "sha256": .string(outcome.sha256),
                 "line_ending": .string(outcome.lineEnding.rawValue),
-                "total_bytes": .number(Double(outcome.usage.bytes)),
             ]), truncated: outcome.diff.isTruncated)
     }
 }
@@ -355,8 +341,6 @@ nonisolated
                 "from": .string(outcome.from), "to": .string(outcome.to),
                 "kind": .string(outcome.kind.rawValue), "files": .number(Double(outcome.files)),
                 "bytes": .number(Double(outcome.bytes)), "overwritten": .bool(outcome.didOverwrite),
-                "total_bytes": .number(Double(outcome.usage.bytes)),
-                "entry_count": .number(Double(outcome.usage.entries)),
             ]))
     }
 
@@ -386,12 +370,11 @@ nonisolated
                 items.append(
                     F.field(
                         "Files",
-                        String(localized: "\(files) files", bundle: .module, locale: input.locale),
+                        AgentLocalization.string("\(files) files", locale: input.locale),
                         locale: input.locale
                     ))
             }
             F.appendBytes(&items, "Size", object["bytes"], locale: input.locale)
-            F.appendBytes(&items, "Workspace usage", object["total_bytes"], locale: input.locale)
             return items
         }
     }
@@ -527,13 +510,10 @@ public nonisolated struct ScratchDeleteTool: AgentToolDefinition, AgentToolSchem
         let path = try arguments.string("path")
         let kind = ScratchEntryKind(rawValue: try arguments.string("kind")) ?? .file
         try await workspace.delete(path, kind: kind)
-        let usage = try await workspace.usage()
         return Self.result(
             invocation,
             .object([
                 "path": .string(path), "kind": .string(kind.rawValue), "deleted": .bool(true),
-                "total_bytes": .number(Double(usage.bytes)),
-                "entry_count": .number(Double(usage.entries)),
             ]))
     }
 }
@@ -547,18 +527,7 @@ nonisolated
         typealias F = AgentToolDetailFormatting
         return F.objectItems(input) { object in
             let entries = object["entries"]?.arrayValue ?? []
-            let entryCount = object["entry_count"]?.integerValue ?? entries.count
-            let entryQuota = object["entry_quota"]?.integerValue
-            let totalBytes = object["total_bytes"]?.integerValue ?? 0
-            let byteQuota = object["byte_quota"]?.integerValue
-            var summary =
-                entryQuota.map { "\(entryCount) / \($0) entries" }
-                ?? String(localized: "\(entryCount) entries", bundle: .module, locale: input.locale)
-            if let byteQuota {
-                summary += " · \(F.byteCount(totalBytes)) / \(F.byteCount(byteQuota))"
-            } else {
-                summary += " · \(F.byteCount(totalBytes))"
-            }
+            let summary = AgentLocalization.string("\(entries.count) entries", locale: input.locale)
             let rows = entries.compactMap { entry -> AgentToolDetail.ListRow? in
                 guard let fields = entry.objectValue else { return nil }
                 let path =
@@ -631,8 +600,8 @@ nonisolated
             let skipped = object["skipped_binary_files"]?.integerValue ?? 0
             var items: [AgentToolDetail.Item] = [
                 .message(
-                    String(
-                        localized: "\(matching) matching lines in \(searched) files",
+                    AgentLocalization.string(
+                        "\(matching) matching lines in \(searched) files",
                         locale: input.locale
                     ),
                     matching == 0 ? .secondary : .success
@@ -660,8 +629,8 @@ nonisolated
             if object["truncated"]?.boolValue == true {
                 items.append(
                     .message(
-                        String(
-                            localized: "Showing \(returned) of \(matching) matching lines",
+                        AgentLocalization.string(
+                            "Showing \(returned) of \(matching) matching lines",
                             locale: input.locale
                         ),
                         .warning
@@ -670,7 +639,7 @@ nonisolated
             if skipped > 0 {
                 items.append(
                     .message(
-                        String(localized: "Skipped \(skipped) binary files", bundle: .module, locale: input.locale),
+                        AgentLocalization.string("Skipped \(skipped) binary files", locale: input.locale),
                         .secondary
                     ))
             }
@@ -705,7 +674,6 @@ nonisolated
             items.append(F.field("Result", result, locale: input.locale))
             F.appendBytes(&items, "Size", object["bytes"], locale: input.locale)
             F.appendField(&items, "SHA-256", object["sha256"]?.stringValue, locale: input.locale, monospaced: true)
-            F.appendBytes(&items, "Workspace usage", object["total_bytes"], locale: input.locale)
             return items
         }
     }
@@ -728,8 +696,8 @@ nonisolated
                 items.append(
                     F.field(
                         "Changes",
-                        String(
-                            localized: "\(count) replacements applied", bundle: .module,
+                        AgentLocalization.string(
+                            "\(count) replacements applied",
                             locale: input.locale
                         ),
                         locale: input.locale
@@ -737,7 +705,7 @@ nonisolated
             } else if let count = object["edits_applied"]?.integerValue {
                 items.append(
                     F.field(
-                        "Changes", String(localized: "\(count) edits applied", bundle: .module, locale: input.locale),
+                        "Changes", AgentLocalization.string("\(count) edits applied", locale: input.locale),
                         locale: input.locale
                     ))
             }
@@ -750,7 +718,6 @@ nonisolated
                 locale: input.locale
             )
             F.appendField(&items, "SHA-256", object["sha256"]?.stringValue, locale: input.locale, monospaced: true)
-            F.appendBytes(&items, "Workspace usage", object["total_bytes"], locale: input.locale)
             return items
         }
     }
@@ -777,8 +744,8 @@ nonisolated
             } else if let a, let b, a != b {
                 items.append(
                     .message(
-                        String(
-                            localized: "Text is identical; line endings differ: \(a) → \(b)",
+                        AgentLocalization.string(
+                            "Text is identical; line endings differ: \(a) → \(b)",
                             locale: input.locale
                         ),
                         .warning
@@ -808,15 +775,6 @@ nonisolated
                     F.kindLabel($0, locale: input.locale)
                 }, locale: input.locale
             )
-            let count = object["entry_count"]?.integerValue
-            let bytes = object["total_bytes"]?.integerValue
-            if count != nil || bytes != nil {
-                let parts = [
-                    count.map { String(localized: "\($0) entries", bundle: .module, locale: input.locale) },
-                    bytes.map(F.byteCount),
-                ].compactMap { $0 }
-                items.append(F.field("Workspace", parts.joined(separator: " · "), locale: input.locale))
-            }
             return items
         }
     }
@@ -887,7 +845,6 @@ public nonisolated struct ScratchFetchTool: AgentToolDefinition, AgentToolSchema
                 "format": .string(format), "scratch_path": .string(written.path),
                 "bytes": .number(Double(written.bytes)), "sha256": .string(written.sha256),
                 "lines": .number(Double(UnifiedDiff.split(LineEnding.normalizedToLF(selected)).lines.count)),
-                "total_bytes": .number(Double(written.usage.bytes)),
             ]))
     }
 }
@@ -926,7 +883,6 @@ nonisolated
                 items.append(F.field("Lines", String(lines), locale: input.locale))
             }
             F.appendField(&items, "SHA-256", object["sha256"]?.stringValue, locale: input.locale, monospaced: true)
-            F.appendBytes(&items, "Workspace usage", object["total_bytes"], locale: input.locale)
             return items
         }
     }

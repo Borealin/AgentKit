@@ -40,6 +40,45 @@ import Testing
         #expect(AgentSkillDocument.render(decoded).contains("  owner: team"))
         #expect(decoded.package?.files["assets/image.bin"] == Data([0, 255]))
     }
+    @Test(arguments: ["\n", "\r\n"], ["---", " \t--- \t"])
+    func skillFrontmatterKeepsMetadataAcrossAcceptedFences(_ newline: String, _ fence: String) throws {
+        let source = [
+            "", " ", fence, "name : example", "description : Original summary",
+            "metadata:", "  # Keep this comment", "  owner: team", "  description: nested value",
+            "allowed-tools: read", fence, "", "# Body", "Instructions",
+        ].joined(separator: newline)
+        let document = try AgentSkillDocument.parse(source)
+        let edited = AgentSkill(
+            name: "renamed", summary: "Updated summary", body: document.body, package: document.package)
+        let rendered = AgentSkillDocument.render(edited)
+        let reopened = try AgentSkillDocument.parse(rendered)
+
+        #expect(reopened.name == "renamed")
+        #expect(reopened.description == "Updated summary")
+        #expect(reopened.body == "# Body\nInstructions")
+        #expect(reopened.package.frontmatter.contains("  owner: team"))
+        #expect(reopened.package.frontmatter.contains("  description: nested value"))
+        #expect(reopened.package.frontmatter.contains("  # Keep this comment"))
+        #expect(reopened.additionalFields["allowed-tools"] == "read")
+        #expect(!reopened.warnings.isEmpty)
+        #expect(!rendered.contains("name : example"))
+        #expect(!rendered.contains("description : Original summary"))
+    }
+
+    @Test(arguments: [">-", "|-"])
+    func skillFrontmatterPreservesBlockDescriptionsAndInertFields(_ marker: String) throws {
+        let document = try AgentSkillDocument.parse(
+            "\n --- \nname: example\ndescription: \(marker)\n  First line\n  second line\nmetadata:\n  owner: team\n --- \nBody"
+        )
+        #expect(document.description == (marker == ">-" ? "First line second line" : "First line\nsecond line"))
+        #expect(document.package.frontmatter == "metadata:\n  owner: team")
+    }
+
+    @Test(arguments: ["name: example\ndescription: Test", "---\nname: example\ndescription: Test"])
+    func skillFrontmatterStillRequiresBothFences(_ source: String) {
+        #expect(throws: AgentSkillImportError.missingFrontmatter) { try AgentSkillDocument.parse(source) }
+    }
+
     @Test func skillPatchRequiresUniqueTextAndPreservesOtherFiles() throws {
         let original = AgentSkill(
             name: "example", summary: "Example", body: "Original",
@@ -152,6 +191,54 @@ import Testing
         let request = try #require(await model.lastRequest)
         #expect(!request.systemPrompt.contains("replace me"))
         #expect(!request.messages[0].text.contains("replace me"))
+    }
+
+    @Test func memoryReferencesBudgetCompleteEntriesByUnicodeScalar() {
+        let entry = AgentMemoryEntry(target: .user, content: "blue e\u{301} 🧑‍💻")
+        let state = AgentMemoryState(entries: [entry])
+        let rendered = "[\(entry.id.uuidString)] user: \(entry.content)"
+        let cost = rendered.unicodeScalars.count + 1
+
+        #expect(state.referenceEntries(matching: "blue", characterBudget: cost).map(\.id) == [entry.id])
+        #expect(state.referenceEntries(matching: "blue", characterBudget: cost - 1).isEmpty)
+        #expect(state.reference(matching: "blue", characterBudget: cost + 80) == rendered)
+        let omitted = state.reference(matching: "blue", characterBudget: cost + 79)
+        #expect(!omitted.contains(entry.content))
+        #expect(omitted.contains("1 entries omitted"))
+    }
+
+    @Test(arguments: [false, true], [false, true])
+    func learningMutationsMatchTheRenderedReference(correction: Bool, visibleTarget: Bool) async throws {
+        let shown = AgentMemoryEntry(
+            target: .memory, content: "blue preference " + String(repeating: "a", count: 8_000))
+        let hidden = AgentMemoryEntry(
+            target: .memory, content: "hidden preference " + String(repeating: "b", count: 8_000))
+        let state = AgentMemoryState(entries: [shown, hidden])
+        let old = visibleTarget ? "blue preference" : "hidden preference"
+        let model = MemoryReplyModel(
+            reply:
+                "{\"operations\":[{\"action\":\"replace\",\"target\":\"memory\",\"old_text\":\"\(old)\",\"content\":\"updated preference\"}]}"
+        )
+        let message = AgentTranscriptMessage(role: .user, text: "blue preference")
+        func operations() async throws -> [AgentMemoryOperation] {
+            if correction {
+                return try await AgentMemoryLearningService().correction(
+                    message: message, context: [], state: state, model: model)
+            }
+            return try await AgentMemoryLearningService().review(messages: [message], state: state, model: model)
+        }
+        if visibleTarget {
+            let updated = try state.applying(await operations())
+            #expect(updated.entries.first { $0.id == shown.id }?.content == "updated preference")
+            #expect(updated.entries.first { $0.id == hidden.id }?.content == hidden.content)
+        } else {
+            await #expect(throws: (any Error).self) { try await operations() }
+        }
+        let request = try #require(await model.lastRequest)
+        let prompt = try #require(request.messages.first?.text)
+        #expect(prompt.contains(shown.id.uuidString))
+        #expect(!prompt.contains(hidden.id.uuidString))
+        #expect(prompt.contains("1 entries omitted"))
     }
 
     @Test func learningIgnoresAgentRoutedMessagesForReviewAndCorrection() async throws {

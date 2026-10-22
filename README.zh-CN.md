@@ -1,6 +1,6 @@
 # AgentKit
 
-[English](README.md) · **简体中文（中国）** · [正體中文（臺灣）](README.zh-TW.md) · [日本語](README.ja.md)
+[Deutsch](README.de.md) · [English](README.md) · [Français](README.fr.md) · [日本語](README.ja.md) · [한국어](README.ko.md) · **简体中文（中国）** · [正體中文（臺灣）](README.zh-TW.md)
 
 用 Swift 构建 AI 智能体，集成工具编排、明确的权限控制和持久化的对话状态。
 
@@ -16,7 +16,7 @@
 添加包依赖：
 
 ```swift
-.package(url: "https://github.com/AkinoKaede/AgentKit.git", from: "0.16.0")
+.package(url: "https://github.com/AkinoKaede/AgentKit.git", from: "4.0.0")
 ```
 
 然后将核心产品添加到目标：
@@ -30,7 +30,7 @@
 
 ## 使用方式
 
-以下示例使用 Responses 端点，仅启用当前对话的私有暂存区工具。
+以下示例使用 Responses 端点和始终提供的共享暂存区工具。
 在异步上下文中调用它，从应用的凭据存储中提供 API 密钥，并传入 `manualApproval` 闭包：
 由闭包展示审批界面，返回 `.allow` 或 `.deny(reason)`。
 
@@ -51,19 +51,19 @@ func runAgent(
         baseURL: "https://api.openai.com/v1"
     )
     let model = AIModel(id: "gpt-4.1-mini", abilities: [.toolCall])
-    let workspace = AgentScratchWorkspace(
-        conversationID: conversationID,
-        applicationName: "MyApp"
-    )
+    let workspace = AgentScratchWorkspace.shared(applicationName: "MyApp")
+    var configuration = AgentLoopConfiguration()
+    configuration.outputProjection = AgentToolOutputProjection(workspace: workspace)
     let runtime = AgentRuntime(
         model: AgentProviderClient(provider: provider, model: model, secret: apiKey),
         registry: AgentToolCatalog.registry(
             builtIn: AgentBuiltInToolConfiguration(
-                groups: [.scratch],
+                groups: [],
                 workspace: workspace
             )
         ),
-        approval: AgentApprovalBroker(reviewer: nil, manualApproval: manualApproval)
+        approval: AgentApprovalBroker(reviewer: nil, manualApproval: manualApproval),
+        configuration: configuration
     )
     let request = AgentRunRequest(
         conversationID: conversationID,
@@ -109,6 +109,23 @@ func runAgent(
   `AgentSystemPrompt.default`。
 
 ## 架构
+
+通过每个 `AgentToolDetailPresenter` 的 `layout: AgentToolDetailLayout` 注册展示策略。
+`singleLineHeader` 和 `boundsApprovalHeight` 分别声明单行标题与审批详情高度约束；`truncateStrategy`
+为纯展示折叠选择 `head`、`tail`、`middle` 或 `none`。默认使用普通标题、自然审批高度和 `head`；
+`.compact` 同时启用两项布局提示。宿主将注册的布局传入 `AgentToolDetail(items:layout:)`，不要按工具名
+分支。元数据文本块设置 `isCollapsible: false`，无论处于什么位置都不占正文预览预算。审批参数始终可以
+完整阅读。布局只从可信的本地 presenter 注册表解析，不接受 MCP 载荷中的配置。这些策略不改变模型截断、
+落盘文件或截断 marker。
+
+```swift
+static let presenter = AgentToolDetailPresenter(
+    id: "example.logs",
+    layout: .init(singleLineHeader: true, boundsApprovalHeight: true, truncateStrategy: .tail),
+    present: present,
+    presentArguments: presentArguments
+)
+```
 
 `AgentRuntime` 是协调器，而不是把模型适配和工具实现集中在一起的庞大组件。
 它管理一次运行的任务、对话快照、引导消息队列和事件通道，将各阶段委托给可以独立测试的组件。
@@ -183,8 +200,8 @@ Anthropic 的独立缓存计数则单独处理。实时 Chat Completions 收到�
 
 | 工具组 | 工具 | 依赖 |
 | --- | --- | --- |
-| `.scratch` | `scratch_list`、`scratch_read`、`scratch_search`、`scratch_write`、`scratch_replace`、`scratch_copy`、`scratch_move`、`scratch_diff`、`scratch_delete` | `workspace: AgentScratchWorkspace` |
-| `.web` | `fetch`、`web_search`、`scratch_fetch` | 抓取需要 `web: AgentWebFetching`；搜索需要 `search: AgentWebSearching`；`scratch_fetch` 还需要 `.scratch` 和暂存区 |
+| 始终提供 | `scratch_list`、`scratch_read`、`scratch_search`、`scratch_write`、`scratch_replace`、`scratch_copy`、`scratch_move`、`scratch_diff`、`scratch_delete` | `workspace: AgentScratchWorkspace` |
+| `.web` | `fetch`、`web_search`、`scratch_fetch` | `web: AgentWebFetching`, `search: AgentWebSearching` |
 | `.userInteraction` | `request_user_input`、`request_user_secret` | 无工具目录依赖；需要提供 runtime 的用户交互处理器 |
 | `.planning` | `present_plan` | 暂存区和 `plans: AgentPlanRecorder` |
 | `.tasks` | `manage_tasks` | `tasks: AgentTaskList`；仅限执行模式 |
@@ -209,8 +226,11 @@ Anthropic 的独立缓存计数则单独处理。实时 Chat Completions 收到�
   安装过程不会执行脚本。
 - `AgentMemoryAccessing` 提供按需记忆检索和已保存对话搜索。
   在上下文管线中使用 `AgentMemoryContext` 仅注入可撤销的检索策略，不注入记忆正文。
-  `memory_search` 返回有界的完整条目。`AgentMemoryLearningService` 基于有界参考数据提出
-  经过验证的更新，由宿主决定何时审查和应用。
+  `memory_search` 返回有界的完整条目。词法搜索会将自然语言问题拆分为搜索词（包括中文词语），
+  先查找匹配所有有效搜索词的条目，仅在没有结果时扩大到匹配任意搜索词的条目。
+  它不会推断同义词，也不会进行跨语言翻译。`AgentSearchQuery` 与宿主的 `session_search`
+  存储共享这套查询解析和安全的 FTS5 搜索词引用处理。`AgentMemoryLearningService` 基于有界参考数据
+  提出经过验证的更新，由宿主决定何时审查和应用。
 
 工具注册与上下文注入彼此独立：通过 `AgentTurnContextSnapshot.skillCatalog` 传入已启用技能目录的
 `catalogBlock`，模型就能发现适用流程，而无需加载所有技能正文。
@@ -241,7 +261,7 @@ let webTools = AgentBuiltInToolConfiguration(
 ```
 
 将配置传给 `AgentToolCatalog.registry(builtIn:)`。只提供 `web:` 会启用网页抓取，**不会**启用
-`web_search`；`search:` 是独立依赖。要启用 `scratch_fetch`，还需选择 `.scratch` 并提供暂存区。
+`web_search`；`search:` 是独立依赖。`scratch_fetch` 自动使用共享暂存区。
 
 如果服务商与模型支持原生搜索，可以将 `AgentProviderClient(webSearch:)` 设为 `true`，并省略 `search:`。
 请先检查 `ModelProvider.supportsNativeWebSearch(model:)`；协议兼容并不意味着网关实现了服务端搜索。
@@ -291,10 +311,56 @@ Guardian 在隔离的 `.reviewing` 模式下运行，默认不注册调查工具
 `ReviewerReadOnlyApproval` 只允许已标记为 `.approve` 的调用，且没有升级审批路径，避免递归审查。
 `GuardianSessionStore` 在多次运行间保存有界的授权基线和决定，不将它们混入主对话。
 
-用户输入的秘密通过可清零的 `AgentSecret` 存储和 `SecretBroker` 以一次性句柄传递，并绑定到运行、工具和用途；
-明文不会进入模型输入、审查、事件和持久化记录。工具输出均视为不可信数据。
+用户输入的秘密通过可清零的 `AgentSecret` 存储和 `SecretBroker` 以一次性句柄传递。
+通过 `issue(secret)` 存入秘密，通过 `consume(handle)` 取出一次。调用方管理 broker 的生命周期，
+可在多次运行间复用，并在其作用域结束时调用 `discardAll()` 清理。
+`request_user_secret` 接收 `prompt`、向用户展示的 `purpose` 和可选的 `timeout_seconds`，
+返回 `secret_handle` 和 `single_use`。明文不会进入模型输入、审查、事件和持久化记录。
+工具输出均视为不可信数据。
 唯一的窄范围例外是已安装技能的 `SKILL.md`：它可以提供操作流程，但不能授予权限；
 其辅助文件仍是不可信的参考数据。
+
+## 共享暂存区与工具输出
+
+Scratch 是强制能力，同一设备上同一应用内的所有对话共享。`AgentScratchWorkspace.shared(applicationName:)` 返回同一个协调器，工具配置与 `AgentLoopConfiguration.outputProjection` 应使用同一实例。根目录为 Application Support / applicationName / Scratch，不再附加会话 ID；删除或分叉对话不会删除或复制文件。AI 需要主动选择任务相关的相对路径，覆盖前检查已有文件。缺失的父目录会自动创建，路径和符号链接校验仍有效。
+
+`AgentTruncateStrategy` 支持 `head`（默认）、`tail`、`middle` 和 `none`。`AgentTruncateLimits` 默认为 64 KiB（65,536 UTF-8 字节）及 2,000 个逻辑行，不截半行；单行超限时也不返回残缺行。模型投影计入 JSON 转义和外层字段的开销。分页读取保留实际的下一偏移量，不创建 accumulator，也不把读取的分页再次落盘。
+
+落盘由工具选择接入，不是模型参数，也不是 Scratch 开关。下方通用工厂接收完整 Scratch 相对路径的生成闭包，仅在需要落盘时调用。目录和文件名由工具决定；AgentKit 不强制前缀或扩展名，只自动创建父目录、校验路径边界并避免覆盖重名文件。工具推荐使用 `<conversationID>/outputs/<tool-name>-<UUID>.txt`（工具名中的下划线改为连字符）；这是文件组织约定，不是会话隔离。没有 conversationID 的调用上下文可以使用 runID。外部 MCP 的落盘文件使用被调用工具的名称。连续快照复用同一文件；非流式工具可调用 `await accumulator.capturing(result)`。
+
+AgentKit 统一生成两种不翻译的 marker：成功落盘使用 `[Showing lines <start>-<end> of <total>. Full output: <path>]`，其余情况使用 `[Showing lines <start>-<end> of <total>]`。落盘错误与续读 offset/cursor 保留在独立结果字段中，不增加 marker。UI 折叠独立，既不生成截断 marker，也不触发落盘。展示层可以显示实际截断时冻结的 `AgentToolResult.truncateMarker`。调用外部 MCP 的返回值使用 `middle` 并落盘；外部客户端调用本地工具时不应用模型截断，也不创建 Scratch 输出。
+
+```swift
+let conversationID = (context.conversationID ?? context.runID).uuidString.lowercased()
+let accumulator = context.makeOutputAccumulator {
+    "\(conversationID)/outputs/my-tool-\(UUID().uuidString.lowercased()).txt"
+}
+accumulator.append(Data("one complete line\n".utf8))
+let snapshot = await accumulator.snapshot()
+// snapshot.output, snapshot.capture?.path, snapshot.capture?.error
+```
+
+Scratch 不设置单文件大小、工作区总容量或文件数量配额。accumulator 在内存中保留完整输出，并原子替换累积快照，不是磁盘流式存储。`snapshot(capturePath:)` 可按工具指定的路径保存独立快照。写入失败会报告 `capture.error`，不宣称已保存完整副本。
+
+Marker 参考 Pi 的行范围格式。`middle` 列出保留的两段范围；总行数未知时省略 `of <total>`；超长单行可能得到 `[Showing 0 of 1 lines]`。仅成功落盘时附加 `Full output: <path>`。
+
+### 内置工具输出策略
+
+| 工具 / 结果 | 策略 | 自动落盘 |
+| --- | --- | --- |
+| `fetch`, `web_search` | `head` | 是 |
+| MCP | `middle` | 是 |
+| `scratch_read`, `skill_read_file` | `head`，分页 | 否 |
+| `read_chat` | `head`，分页 | 否 |
+| `scratch_search` | `head` | 否 |
+| 其他内置工具 | `head` | 否 |
+| 返回外部客户端的结果 | 绕过 | 否 |
+
+`scratch_fetch` 的主要操作是写入调用方指定的目标路径，并非自动截断落盘。结果数量、分页窗口等源端限制仍有效。可信的已安装 `SKILL.md` 指令使用独立的导入和校验限制。
+
+### 从 1.x 迁移
+
+工具目录与输出投影应使用同一个共享 workspace。`.scratch` 仅保留为兼容的分组标签，不再控制工具开关；工具配置的 workspace 为 nil 时回退到 `.shared()`。`AgentToolOutputProjection.workspace` 不再可选，应将显式 `nil` 改为共享 workspace。旧 workspace 的 `conversationID` 参数不再选择目录，`copyScope` 不再执行操作。已有会话文件夹保留原位，成为普通的相对路径目录；读取旧文件时需加上原目录名。不要随对话删除共享 Scratch。需要自动落盘的工具必须接入 accumulator，输出投影不再为所有超限结果自动存档。
 
 ## 扩展 AgentKit
 
@@ -323,10 +389,10 @@ Guardian 在隔离的 `.reviewing` 模式下运行，默认不注册调查工具
 
 ## 本地化
 
-面向用户的字符串位于 `Localizations/Localizable.xcstrings`，包含英语、简体中文、正体中文和日语，
+面向用户的字符串位于 `Localizations/Localizable.xcstrings`，包含英语、德语、法语、日语、韩语、简体中文和正体中文，
 由 `Scripts/build-localizations.sh` 编译到 `Sources/AgentKit/Resources/*.lproj`。
 修改字符串目录后需重新运行脚本，并提交生成的资源；`swift build` 只复制资源，不编译字符串目录。
-运行 `python3 Scripts/check-cjk-localization.py` 可检查中日文翻译的完整性、格式参数和间距。
+运行 `python3 Scripts/check-localization.py` 可统一检查六种译文的完整性、格式参数、复数和各语言的间距规范。
 
 工具卡片在渲染时根据阅读者的语言环境解析文本，因此已记录的卡片也能以另一种语言展示。
 

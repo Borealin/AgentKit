@@ -46,6 +46,7 @@ public actor AgentRuntime {
     private let approval: any AgentApprovalHandling
     private let repository: any AgentRunPersisting
     private let userInteraction: any AgentUserInteractionHandling
+    /// Caller-owned storage, reusable across runs until explicitly cleared.
     public let secretBroker: SecretBroker
     private let tools: AgentToolRegistry
     private let services: AgentToolServices
@@ -60,13 +61,12 @@ public actor AgentRuntime {
     private let interjection = AgentInterjectionSignal()
     /// Whether a message queued *now* would still be delivered.
     ///
-    /// Not the same question as "is there a run task". `complete` awaits its
+    /// Not the same question as "is there a run task". `finish` awaits its
     /// final persist before it ends the run, and an actor is reentrant at every
     /// await — so a message accepted during that window would land in a queue
     /// nobody drains again. Cleared as the *first* statement of every path that
     /// ends a run, which is what makes the window empty rather than narrow.
     private var acceptsSteering = false
-    private var activeRunID: UUID?
     private var activeContextSnapshot: AgentTurnContextSnapshot?
 
     public init(
@@ -102,7 +102,9 @@ public actor AgentRuntime {
         channel: AgentEventChannel? = nil
     ) {
         self.model = model
-        self.tools = registry
+        self.tools = AgentToolCatalog.registry(
+            builtIn: .init(groups: [], workspace: configuration.outputProjection.workspace),
+            additional: registry.registeredTools)
         self.approval = approval
         self.repository = repository
         self.secretBroker = secretBroker
@@ -161,7 +163,6 @@ public actor AgentRuntime {
         acceptsSteering = false
         runTask?.cancel()
         runTask = nil
-        if let runID = activeRunID { Task { await secretBroker.discardSecrets(for: runID) } }
     }
 
     private func run(_ request: AgentRunRequest) async {
@@ -174,13 +175,11 @@ public actor AgentRuntime {
             // snapshot is persisted, so a call left unanswered by a process
             // that died — or a result left behind by one — is fixed once here
             // rather than re-derived on every future turn of the conversation.
-            messages: AgentOrphanedToolResultRepair.apply(
-                AgentUnansweredToolCallRepair.apply(
-                    AgentSecretLifecycle.sanitizeHistoricalMessages(request.priorMessages)
-                )
+            messages: AgentToolExchangeRepair.apply(
+                AgentSecretLifecycle.sanitizeHistoricalMessages(
+                    request.priorMessages, availableHandles: await secretBroker.availableHandleIDs)
             )
         )
-        activeRunID = snapshot.id
         let runID = snapshot.id
         let sessionContext = request.sessionContext.map {
             AgentTranscriptMessage(role: .user, text: $0)
@@ -229,18 +228,22 @@ public actor AgentRuntime {
             pacing: configuration.streamPacing,
             retryPolicy: configuration.modelRetryPolicy
         )
+        var executor = AgentToolExecutor(
+            tools: availableTools, approval: approval, hooks: hooks, channel: channel,
+            secretBroker: secretBroker, userInteraction: userInteraction,
+            services: services,
+            runID: runID, conversationID: request.conversationID, permissionMode: request.permissionMode,
+            userIntent: request.prompt,
+            interjection: { [interjection] in await interjection.wait() },
+            outputProjection: configuration.outputProjection,
+            isToolAvailable: { [weak self] name in await self?.isToolAvailable(name) ?? false },
+            authorizationEvidence: { await evidenceLog.snapshot() }
+        )
+        executor.resultDidFinish = { call, result in
+            await evidenceLog.append(GuardianEvidence.answers(call: call, resultText: result.content))
+        }
         let scheduler = AgentToolScheduler(
-            executor: AgentToolExecutor(
-                tools: availableTools, approval: approval, hooks: hooks, channel: channel,
-                secretBroker: secretBroker, userInteraction: userInteraction,
-                services: services,
-                runID: runID, permissionMode: request.permissionMode,
-                userIntent: request.prompt,
-                interjection: { [interjection] in await interjection.wait() },
-                outputProjection: configuration.outputProjection,
-                isToolAvailable: { [weak self] name in await self?.isToolAvailable(name) ?? false },
-                authorizationEvidence: { await evidenceLog.snapshot() }
-            ),
+            executor: executor,
             mode: configuration.toolExecution,
             maximumConcurrency: configuration.maximumToolConcurrency
         )
@@ -281,7 +284,7 @@ public actor AgentRuntime {
                     // never shown. Pi keeps its inner loop alive while messages
                     // are pending for exactly this reason; the next iteration
                     // delivers them and asks again.
-                    if steering.isEmpty { return try await complete(snapshot, runID: runID) }
+                    if steering.isEmpty { return await finish(snapshot, state: .completed) }
                     continue
                 }
 
@@ -306,14 +309,7 @@ public actor AgentRuntime {
                 }
                 for (call, result) in zip(turn.message.toolCalls, results) {
                     snapshot.messages.append(
-                        AgentTranscriptMessage(
-                            id: AgentTranscriptMessage.toolResultID(runID: runID, callID: result.callID),
-                            role: .tool, text: result.content, toolCallID: result.callID,
-                            toolName: call.name, isError: result.isError, modelText: result.modelContent
-                        ))
-                    await evidenceLog.append(
-                        GuardianEvidence.answers(call: call, resultText: result.content)
-                    )
+                        AgentTranscriptMessage.toolResult(result, runID: runID, toolName: call.name))
                 }
                 try await persist(snapshot)
                 if let refusal { throw refusal }
@@ -326,15 +322,14 @@ public actor AgentRuntime {
                         index: index, message: turn.message, results: results
                     ))
                 {
-                    return try await complete(snapshot, runID: runID)
+                    return await finish(snapshot, state: .completed)
                 }
             }
         } catch is CancellationError {
-            await terminate(snapshot, state: .cancelled, failure: nil)
+            await finish(snapshot, state: .cancelled)
         } catch {
-            await terminate(snapshot, state: .failed, failure: error.localizedDescription)
+            await finish(snapshot, state: .failed, failure: error.localizedDescription)
         }
-        finish(runID: runID)
     }
 
     /// Empties the queue into the turn that is about to start, and says so.
@@ -361,73 +356,61 @@ public actor AgentRuntime {
         activeContextSnapshot?.toolAvailability?[name] ?? true
     }
 
-    private func complete(_ snapshot: AgentRunSnapshot, runID: UUID) async throws {
+    private func finish(
+        _ snapshot: AgentRunSnapshot, state: AgentRunState, failure: String? = nil
+    ) async {
         acceptsSteering = false
         var finished = snapshot
-        finished.state = .completed
+        finished.state = state
+        finished.failure = failure
         finished.finishedAt = .now
-        try await persist(finished)
-        try await channel.emitCommitted(
-            .runFinished(
-                AgentRunSummary(
-                    id: runID, state: .completed, startedAt: finished.startedAt,
-                    finishedAt: finished.finishedAt
-                )))
-        channel.emit(.runState(.completed))
-        finish(runID: runID)
+        if state == .completed {
+            do {
+                try await persist(finished)
+                try await channel.emitCommitted(
+                    .runFinished(
+                        AgentRunSummary(
+                            id: finished.id, state: .completed, startedAt: finished.startedAt,
+                            finishedAt: finished.finishedAt)))
+            } catch {
+                return await finish(
+                    snapshot, state: error is CancellationError ? .cancelled : .failed,
+                    failure: error is CancellationError ? nil : error.localizedDescription)
+            }
+        } else {
+            // Cleanup outlives cancellation of the running task. Drain accepted
+            // writes, then attempt the failed/cancelled terminal save even when
+            // the drain failed. Real storage errors take precedence over Stop.
+            let terminal = finished
+            finished = await Task {
+                var terminal = terminal
+                do { try await channel.flush() } catch {
+                    if !(terminal.state == .cancelled && error is CancellationError) {
+                        terminal.state = .failed
+                        terminal.failure = error.localizedDescription
+                    }
+                }
+                do { try await repository.save(terminal) } catch {
+                    terminal.state = .failed
+                    terminal.failure = error.localizedDescription
+                }
+                return terminal
+            }.value
+            if let failure = finished.failure { channel.emit(.failed(failure)) }
+            channel.emit(
+                .runFinished(
+                    AgentRunSummary(
+                        id: finished.id, state: finished.state, startedAt: finished.startedAt,
+                        finishedAt: finished.finishedAt, failure: finished.failure)))
+        }
+        channel.emit(.runState(finished.state))
+        runTask = nil
+        channel.finish()
     }
 
     private func persist(_ snapshot: AgentRunSnapshot) async throws {
         try await channel.flush()
         try await repository.save(snapshot)
-    }
-
-    /// A failed write must never be reported as successful completion. A
-    /// terminal write may itself fail; still deliver the failure and drain
-    /// the run, rather than retrying side effects or abandoning the reader.
-    private func terminate(_ original: AgentRunSnapshot, state: AgentRunState, failure: String?) async {
-        acceptsSteering = false
-        var snapshot = original
-        snapshot.state = state
-        snapshot.failure = failure
-        snapshot.finishedAt = .now
-        // Cleanup must outlive cancellation of the running task. Drain accepted
-        // events first, then attempt to save even a failed terminal snapshot.
-        // A real write failure wins over cancellation; cancelling a waiter
-        // alone must not turn a user's Stop into a failed run.
-        let terminal = snapshot
-        snapshot = await Task {
-            var terminal = terminal
-            do { try await channel.flush() } catch {
-                if !(terminal.state == .cancelled && error is CancellationError) {
-                    terminal.state = .failed
-                    terminal.failure = error.localizedDescription
-                }
-            }
-            do { try await repository.save(terminal) } catch {
-                terminal.state = .failed
-                terminal.failure = error.localizedDescription
-            }
-            return terminal
-        }.value
-        if let failure = snapshot.failure { channel.emit(.failed(failure)) }
-        channel.emit(
-            .runFinished(
-                AgentRunSummary(
-                    id: snapshot.id, state: snapshot.state,
-                    startedAt: snapshot.startedAt, finishedAt: snapshot.finishedAt, failure: snapshot.failure)))
-        channel.emit(.runState(snapshot.state))
-    }
-
-    private func finish(runID: UUID) {
-        // Secrets, and nothing else. A host's own connections are its own to
-        // pool and release; a run ending is not the event that closes them, and
-        // a runtime that assumed otherwise would tear down a pool it did not
-        // build.
-        Task { await secretBroker.discardSecrets(for: runID) }
-        activeRunID = nil
-        runTask = nil
-        channel.finish()
     }
 }
 

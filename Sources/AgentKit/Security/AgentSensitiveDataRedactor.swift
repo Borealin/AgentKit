@@ -13,7 +13,11 @@ public nonisolated enum AgentSensitiveDataRedactor {
         var output = maximumCharacters.map { String(text.prefix($0)) } ?? text
         for key in sensitiveKeys {
             let escaped = NSRegularExpression.escapedPattern(for: key)
-            let pattern = "(?i)(\\\"?\(escaped)\\\"?\\s*[:=]\\s*)(\\\"[^\\\"]*\\\"|[^\\s,}]+)"
+            // A streaming snapshot may end inside a quoted value. Redact the
+            // entire unfinished value, including whitespace and escaped quotes.
+            let pattern =
+                "(?i)(\\\"?\(escaped)\\\"?\\s*[:=]\\s*)"
+                + #"(\"(?:\\.|[^\"\\])*(?:\"|$)|'(?:\\.|[^'\\])*(?:'|$)|[^\s,}]+)"#
             output = output.replacingOccurrences(
                 of: pattern, with: "$1\"[REDACTED]\"", options: .regularExpression
             )
@@ -52,6 +56,30 @@ public nonisolated enum AgentSensitiveDataRedactor {
         }
     }
 
+    /// Redacts decoded fields before encoding, preserving valid JSON and its framing.
+    /// Malformed or plain text retains the existing visible-text fallback.
+    public static func toolResultText(_ text: String, isUntrusted: Bool = true) -> String {
+        let redacted = redactedToolPayload(text, isUntrusted: isUntrusted)
+        return redacted.value == nil ? visibleText(text) : redacted.text
+    }
+
+    /// Shares the decoded value with projection so it need not parse the redacted JSON again.
+    static func redactedToolPayload(
+        _ text: String, isUntrusted: Bool
+    ) -> (text: String, payload: String, value: AgentJSONValue?) {
+        let result = AgentToolResult(callID: "", content: text, metadata: ["untrusted": .bool(isUntrusted)])
+        let untrustedPayload = result.untrustedPayload
+        let value = AgentToolResult.decodeStructuredPayload(
+            untrustedPayload ?? text, isUntrusted: false
+        ).map(redactedJSON)
+        let payload = value?.encodedString ?? visibleText(untrustedPayload ?? text)
+        let framed =
+            untrustedPayload == nil
+            ? payload
+            : AgentToolResult.untrustedDataOpeningMarker + payload + AgentToolResult.untrustedDataClosingMarker
+        return (framed, payload, value)
+    }
+
     public static func isSensitiveHeader(_ name: String) -> Bool {
         isSensitiveKey(name.replacingOccurrences(of: "-", with: "_"))
     }
@@ -62,21 +90,13 @@ public nonisolated enum AgentSensitiveDataRedactor {
     }
 }
 
-/// Removes capabilities whose lifetime ended with the run that issued them.
-///
-/// Secret handles are deliberately process-local, run-bound, and single-use.
-/// A transcript is durable and replayed, so retaining a handle there would
-/// invite a future model turn to reuse a value that cannot possibly work. The
-/// live run is not passed through this type: it still needs the real result for
-/// the immediate handoff from `request_user_secret` to whichever tool consumes
-/// the handle.
+/// Removes unavailable capabilities from replayed history without expiring
+/// handles that the caller's broker still owns. Durable storage preserves none.
 public nonisolated enum AgentSecretLifecycle {
     /// The argument a consuming tool takes a handle in.
     ///
     /// One name, shared, because history is sanitized without knowing which
-    /// tools an app registered: anything called with a `secret_handle` had one,
-    /// and a handle in a replayed transcript is a capability that expired with
-    /// the run that issued it.
+    /// tools an app registered.
     public static let handleArgumentKey = "secret_handle"
 
     public static let expiredResultContent =
@@ -88,7 +108,8 @@ public nonisolated enum AgentSecretLifecycle {
         + AgentToolResult.untrustedDataClosingMarker
 
     public static func sanitizeHistoricalMessages(
-        _ messages: [AgentTranscriptMessage]
+        _ messages: [AgentTranscriptMessage],
+        availableHandles: Set<UUID> = []
     ) -> [AgentTranscriptMessage] {
         let secretRequestCallIDs = Set(
             messages.flatMap(\.toolCalls).compactMap { call in
@@ -100,7 +121,8 @@ public nonisolated enum AgentSecretLifecycle {
             if message.role == .assistant {
                 message.toolCalls = message.toolCalls.map { originalCall in
                     guard var arguments = originalCall.arguments.objectValue,
-                        arguments[handleArgumentKey] != nil
+                        arguments[handleArgumentKey] != nil,
+                        !isAvailable(arguments[handleArgumentKey], in: availableHandles)
                     else { return originalCall }
                     arguments.removeValue(forKey: handleArgumentKey)
                     var call = originalCall
@@ -112,8 +134,11 @@ public nonisolated enum AgentSecretLifecycle {
                 message.toolName == "request_user_secret"
                     || message.toolCallID.map(secretRequestCallIDs.contains) == true
             {
-                message.text = expiredResultContent
-                message.modelText = nil
+                let value = AgentToolResult.decodeStructuredPayload(message.text)
+                if !isAvailable(value?.objectValue?[handleArgumentKey], in: availableHandles) {
+                    message.text = expiredResultContent
+                    message.modelText = nil
+                }
             }
             return message
         }
@@ -121,5 +146,10 @@ public nonisolated enum AgentSecretLifecycle {
 
     public static func persistedResultText(toolName: String?, original: String) -> String {
         toolName == "request_user_secret" ? expiredResultContent : original
+    }
+
+    private static func isAvailable(_ value: AgentJSONValue?, in handles: Set<UUID>) -> Bool {
+        guard let raw = value?.stringValue, let id = UUID(uuidString: raw) else { return false }
+        return handles.contains(id)
     }
 }

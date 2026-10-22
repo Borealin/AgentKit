@@ -3,9 +3,11 @@ import Foundation
 public nonisolated struct SkillReadFileTool: AgentToolDefinition, AgentToolSchemaBuilding {
     public static let name = "skill_read_file"
     public static let presenter = AgentToolDetailPresenter(
-        id: "builtin.skill_read_file", present: present, presentArguments: presentArguments)
+        id: "builtin.skill_read_file", layout: .compact, present: present, presentArguments: presentArguments,
+        operation: operation)
     /// Presentation compatibility only. This never registers an executable legacy tool.
-    public static let legacyPresenter = AgentToolDetailPresenter(id: "builtin.load_skill", present: present)
+    public static let legacyPresenter = AgentToolDetailPresenter(
+        id: "builtin.load_skill", present: present, operation: operation)
     public let skills: AgentSkillCatalog
     public init(skills: AgentSkillCatalog) { self.skills = skills }
 
@@ -70,7 +72,7 @@ public nonisolated struct SkillReadFileTool: AgentToolDefinition, AgentToolSchem
         var returned: [String] = []
         var used = 0
         for line in lines.dropFirst(min(offset - 1, lines.count)).prefix(limit) {
-            guard used + line.utf8.count + 1 <= 32_768 else {
+            guard used + line.utf8.count + 1 <= AgentTruncateLimits.maximumBytes else {
                 if returned.isEmpty {
                     throw AgentToolError.invalidArguments("This line exceeds the text window; export the file.")
                 }
@@ -94,7 +96,8 @@ public nonisolated struct SkillReadFileTool: AgentToolDefinition, AgentToolSchem
 }
 
 public nonisolated struct SkillsListTool: AgentToolDefinition, AgentToolSchemaBuilding {
-    public static let presenter = AgentToolDetailPresenter(id: "builtin.skills_list", present: present)
+    public static let presenter = AgentToolDetailPresenter(
+        id: "builtin.skills_list", layout: .compact, present: present, operation: operation)
     public let skills: [AgentSkill]
     public let readOnlyNames: Set<String>
     public init(skills: [AgentSkill], readOnlyNames: Set<String> = []) {
@@ -129,7 +132,8 @@ public nonisolated struct SkillsListTool: AgentToolDefinition, AgentToolSchemaBu
 
 public nonisolated struct SkillManageTool: AgentToolDefinition, AgentToolSchemaBuilding {
     public static let presenter = AgentToolDetailPresenter(
-        id: "builtin.skill_manage", present: present, presentArguments: presentArguments)
+        id: "builtin.skill_manage", layout: .compact, present: present, presentArguments: presentArguments,
+        operation: operation)
     public let library: any AgentSkillLibraryManaging
     public init(library: any AgentSkillLibraryManaging) { self.library = library }
     public var descriptor: AgentToolDescriptor {
